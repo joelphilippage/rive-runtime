@@ -34,6 +34,20 @@ void AudioSound::dispose()
 float AudioSound::volume() { return ma_sound_get_volume(&m_sound); }
 void AudioSound::volume(float value) { ma_sound_set_volume(&m_sound, value); }
 
+float AudioSound::pitch() { return ma_sound_get_pitch(&m_sound); }
+void AudioSound::pitch(float value)
+{
+  if (!(value >= 0.25f))
+  {
+    value = 0.25f;
+  }
+  else if (value > 4.0f)
+  {
+    value = 4.0f;
+  }
+  ma_sound_set_pitch(&m_sound, value);
+}
+
 bool AudioSound::completed() const
 {
   if (m_isDisposed)

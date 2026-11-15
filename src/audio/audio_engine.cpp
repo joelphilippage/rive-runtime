@@ -345,7 +345,7 @@ rcp<AudioSound> AudioEngine::internalPlaySound(
     if (ma_sound_init_from_data_source(
             m_engine,
             audioSound->buffer(),
-            MA_SOUND_FLAG_NO_PITCH | MA_SOUND_FLAG_NO_SPATIALIZATION,
+            MA_SOUND_FLAG_NO_SPATIALIZATION,
             nullptr,
             audioSound->sound()) != MA_SUCCESS)
     {
@@ -388,7 +388,7 @@ rcp<AudioSound> AudioEngine::internalPlaySound(
     if (ma_sound_init_from_data_source(
             m_engine,
             audioSound->clippedDecoder(),
-            MA_SOUND_FLAG_NO_PITCH | MA_SOUND_FLAG_NO_SPATIALIZATION,
+            MA_SOUND_FLAG_NO_SPATIALIZATION,
             nullptr,
             audioSound->sound()) != MA_SUCCESS)
     {

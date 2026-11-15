@@ -250,6 +250,11 @@ static int audio_sound_newindex(lua_State* L)
       sound->volume(value);
       return 0;
     }
+    case (int)LuaAtoms::pitch:
+    {
+      sound->pitch((float)luaL_checknumber(L, 3));
+      return 0;
+    }
     default:
       break;
   }
@@ -287,6 +292,10 @@ static int audio_sound_index(lua_State* L)
   {
     case (int)LuaAtoms::volume:
       lua_pushnumber(L, (lua_Number)sound->volume());
+      return 1;
+
+    case (int)LuaAtoms::pitch:
+      lua_pushnumber(L, (lua_Number)sound->pitch());
       return 1;
 
     default:

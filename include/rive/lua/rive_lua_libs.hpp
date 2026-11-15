@@ -268,6 +268,7 @@ enum class LuaAtoms : int16_t
   seek,
   seekFrame,
   volume,
+  pitch,
   completed,
   time,
   timeFrame,

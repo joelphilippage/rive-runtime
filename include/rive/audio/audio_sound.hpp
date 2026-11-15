@@ -126,6 +126,9 @@ public:
   void resume();
   float volume();
   void volume(float value);
+  /// Playback pitch/speed multiplier (1 = normal), clamped to 0.25..4.
+  float pitch();
+  void pitch(float value);
   bool completed() const;
 
 private:

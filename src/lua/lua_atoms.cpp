@@ -250,6 +250,7 @@ constexpr LuaAtomName atoms[] = {
     {"seek", (int16_t)LuaAtoms::seek},
     {"seekFrame", (int16_t)LuaAtoms::seekFrame},
     {"volume", (int16_t)LuaAtoms::volume},
+    {"pitch", (int16_t)LuaAtoms::pitch},
     {"completed", (int16_t)LuaAtoms::completed},
     {"time", (int16_t)LuaAtoms::time},
     {"timeFrame", (int16_t)LuaAtoms::timeFrame},
