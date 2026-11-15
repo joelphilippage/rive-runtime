@@ -167,7 +167,7 @@ private:
 
   /// Whether the caret was placed (by a press, a key, typing or a focus)
   /// since text set from outside last reset it to the start.
-  bool m_caretPlaced = false;
+  [[maybe_unused]] bool m_caretPlaced = false;
 
   /// Whether this text input currently has focus.
   bool m_focused = false;

@@ -91,11 +91,22 @@ private:
   RefCnt& operator=(const RefCnt&) = delete;
 };
 
+template <typename T, typename = void> struct has_ref_method : std::false_type
+{};
+
+template <typename T>
+struct has_ref_method<T, std::void_t<decltype(std::declval<T&>().ref())>>
+    : std::true_type
+{};
+
 template <typename T> static inline T* safe_ref(T* obj)
 {
   if (obj)
   {
-    obj->ref();
+    if constexpr (has_ref_method<T>::value)
+    {
+      obj->ref();
+    }
   }
   return obj;
 }
@@ -104,7 +115,10 @@ template <typename T> static inline void safe_unref(T* obj)
 {
   if (obj)
   {
-    obj->unref();
+    if constexpr (has_ref_method<T>::value)
+    {
+      obj->unref();
+    }
   }
 }
 
