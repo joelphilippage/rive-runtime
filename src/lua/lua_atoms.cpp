@@ -290,6 +290,7 @@ constexpr LuaAtomName atoms[] = {
     {"onCancel", (int16_t)LuaAtoms::onCancel},
     {"getStatus", (int16_t)LuaAtoms::getStatus},
     {"decodeImage", (int16_t)LuaAtoms::decodeImage},
+    {"loadImage", (int16_t)LuaAtoms::loadImage},
     // Mat4
     {"transpose", (int16_t)LuaAtoms::transpose},
     {"transformPoint", (int16_t)LuaAtoms::transformPoint},
@@ -392,6 +393,8 @@ constexpr LuaAtomName atoms[] = {
     {"delta", (int16_t)LuaAtoms::delta},
     {"precise", (int16_t)LuaAtoms::precise},
     {"pointerScroll", (int16_t)LuaAtoms::pointerScroll},
+    {"keyboardEvent", (int16_t)LuaAtoms::keyboardEvent},
+    {"textEvent", (int16_t)LuaAtoms::textEvent},
 };
 
 constexpr size_t atomCount = std::size(atoms);

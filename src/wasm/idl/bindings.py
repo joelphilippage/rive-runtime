@@ -271,6 +271,7 @@ def ns(module, short, ops, lanes=(), boots=False, as_class=True):
 # names; only append, so a bit keeps its meaning.
 FEATURES = [
     'parallelCalls',
+    'identity',
 ]
 HOST_FEATURES = (1 << len(FEATURES)) - 1
 
@@ -312,6 +313,10 @@ NAMESPACES = [
         op('arg', [string('name', 'nameLength'),
                    mutbuf('char', 'buffer', 'capacity')],
            ret='u32', stub='zero', boot=True),
+        # The frame collector's long idle free chunks: the host gives their
+        # pages back to the system, which a browser cannot.
+        op('release_pages', [u32('start'), u32('length')],
+           web_js='undefined'),
     ]),
     # Data binding tracer: numbers only; more property types, listeners, and
     # the valueChanged callback channel land with the properties namespace.
@@ -333,6 +338,10 @@ NAMESPACES = [
         op('context_parent', [handle('dataContext')], ret='u32'),
         op('context_view_model', [handle('dataContext')], ret='u32'),
         op('context_release', [handle('dataContext')]),
+        # 1 when both handles wrap the same data context.
+        op('context_equal', [handle('a'), handle('b')], ret='u32'),
+        # The data context's stable id, to hash it by; 0 for a stale handle.
+        op('context_identity', [handle('dataContext')], ret='u32'),
         # The Data global: constructors over the file's view models. Empty
         # template means a default instance.
         op('has_view_model', [string('name', 'nameLength')], ret='u32'),
@@ -365,6 +374,9 @@ NAMESPACES = [
         op('vmi_symbol_index', [handle('vmi')], ret='u32'),
         # __eq: both handles wrap the same core instance.
         op('vmi_equal', [handle('a'), handle('b')], ret='u32'),
+        # The core instance's stable id, the same through every handle of it
+        # and no other's; 0 only for a stale handle.
+        op('vmi_identity', [handle('vmi')], ret='u32'),
         # The property's .value: the referenced instance as a new vmi handle.
         op('view_model_get', [handle('property')], ret='u32'),
         op('vmi_list', [handle('vmi'), string('name', 'length')], ret='u32'),
@@ -390,11 +402,21 @@ NAMESPACES = [
         op('blob_present', [handle('property')], ret='u32'),
         op('blob_get', [handle('property'),
                         mutbuf('uint8_t', 'buffer', 'capacity')], ret='u32'),
+        # The bytes copied from offset, as many as out holds.
+        op('blob_read', [handle('property'), u32('offset'),
+                         mutbuf('uint8_t', 'out', 'outByteCount',
+                                written='size')], ret='u32'),
         op('blob_name', [handle('property'),
                          mutbuf('char', 'buffer', 'capacity')], ret='u32'),
         op('blob_set', [handle('property'),
                         buf('uint8_t', 'bytes', 'byteCount')]),
         op('blob_clear', [handle('property')]),
+        # Marks the blob the property holds now as the one the module's copy
+        # of its bytes came from.
+        op('blob_seen', [handle('property')]),
+        # 0 while the property holds the bytes this handle last marked with
+        # blob_seen, 1 once it does not, 2 when it names no blob property.
+        op('blob_changed', [handle('property')], ret='u32'),
         # The bindable artboard the property holds, as a rive_file_v1
         # bindable handle; 0 while it names one of the host file's own
         # artboards, or none.
@@ -411,6 +433,11 @@ NAMESPACES = [
         op('enum_values', [handle('property'),
                            mutbuf('char', 'buffer', 'capacity')], ret='u32'),
         op('prop_release', [handle('property')]),
+        # 1 when both handles wrap the same property of the same instance.
+        op('prop_equal', [handle('a'), handle('b')], ret='u32'),
+        # A number every handle of the same property of the same instance
+        # answers, to hash it by; 0 for a stale handle.
+        op('prop_identity', [handle('property')], ret='u32'),
         op('trigger_fire', [handle('property')]),
         op('list_length', [handle('property')], ret='u32'),
         op('list_push', [handle('property'), handle('vmi')]),
@@ -503,6 +530,19 @@ NAMESPACES = [
         # floats; returns how many scripted drawables took the event.
         op('gamepad_event', [handle('artboard'),
                              buf('uint8_t', 'payload', 'byteCount')],
+           ret='u32'),
+        # artboard:keyboardEvent: key is rive::Key, modifiers KeyModifiers
+        # bits; returns 1 when the artboard's focused control took it.
+        op('keyboard_event', [
+            handle('artboard'),
+            u32('key'),
+            u32('modifiers'),
+            u32('isPressed'),
+            u32('isRepeat'),
+        ], ret='u32'),
+        # artboard:textEvent: UTF-8 text for the focused text input; returns
+        # 1 when it was taken.
+        op('text_event', [handle('artboard'), string('text', 'length')],
            ret='u32'),
         op('animation', [handle('artboard'), string('name', 'length')],
            ret='u32'),
@@ -1013,6 +1053,14 @@ NAMESPACES = [
             string('name', 'nameLength'),
             mutbuf('uint8_t', 'out', 'outCount'),
         ], ret='u32'),
+        # The bytes of the same asset copied from offset, as many as out
+        # holds.
+        op('asset_read', [
+            handle('object'),
+            string('name', 'nameLength'),
+            u32('offset'),
+            mutbuf('uint8_t', 'out', 'outByteCount', written='size'),
+        ], ret='u32'),
     ]),
     ns('rive_image_v1', 'image', [
         # Resolves an ImageAsset by name from the object's file, pinning its
@@ -1030,6 +1078,12 @@ NAMESPACES = [
         op('decode', [buf('uint8_t', 'bytes', 'byteCount'), u32('token')],
            ret='u32', stub='hook'),
         op('decode_cancel', [u32('token')]),
+        # Decodes encoded image bytes into a new image through the host's
+        # factory, on the calling thread, for context:loadImage. Returns 0
+        # when the host has no factory or a native one cannot decode the
+        # bytes; the web and deferred factories return an image that decodes
+        # later, blank when the bytes are bad.
+        op('load', [buf('uint8_t', 'bytes', 'byteCount')], ret='u32'),
     ]),
     # The Luau Font builtin: metrics, variable instances and glyph outlines.
     ns('rive_font_v1', 'font', [
@@ -1198,7 +1252,9 @@ NAMESPACES = [
         op('fetch_cancel', [u32('token')]),
     ]),
     # context:decodeFile and what it returns: decoded files and their
-    # bindable artboards are host objects behind handles.
+    # bindable artboards are host objects behind handles. The bindable ops
+    # and host_bindable need no networking; decode answers unavailable
+    # without it.
     ns('rive_file_v1', 'file', [
         # 0 when no file results, with statusOut[0] set to the
         # FileDecodeWire status saying why.
@@ -1223,8 +1279,17 @@ NAMESPACES = [
         # The instance of the artboard's own view model as a rive_data_v1
         # vmi handle; 0 when the artboard has none.
         op('bindable_data', [handle('bindable')], ret='u32'),
+        # One of the script's own file's artboards (context.bindableArtboard),
+        # by name or the default artboard when useDefault is set, pinned to
+        # no file and with no view model of its own, so a host binds it as
+        # it binds an authored artboard id; 0 when absent.
+        op('host_bindable', [handle('object'), string('name', 'nameLength'),
+                             u32('useDefault')], ret='u32'),
         # Both handles carry the same bindable artboard.
         op('bindable_equal', [handle('a'), handle('b')], ret='u32'),
+        # The bindable artboard's stable id, to hash it by; 0 for a stale
+        # handle.
+        op('bindable_identity', [handle('bindable')], ret='u32'),
     ]),
     # Jobs, workers and audio processors, each an instance of its lane module;
     # kinds and states are lane_layout.py's.
@@ -1387,7 +1452,7 @@ LANE_IMPORTS = [
     lane_import('rive_job_v1', ('job',)),
     lane_import('rive_worker_v1', ('worker',)),
 ] + [lane_import('env', LANES, 'console.' + level)
-     for level in ('log', 'debug', 'info', 'warn', 'error')] + [
+     for level in ('caller', 'log', 'debug', 'info', 'warn', 'error')] + [
     lane_import('env', ('job', 'worker'), 'console.' + timer)
     for timer in ('time', 'timeLog', 'timeEnd')]
 
@@ -1401,7 +1466,8 @@ LEAF_OPS = {
         'vmi_view_model', 'vmi_list', 'vmi_enum', 'vmi_image', 'vmi_font',
         'vmi_blob', 'number_get', 'boolean_get', 'string_get',
         'string_changed', 'color_get', 'enum_get', 'list_length', 'list_get',
-        'view_model_get',
+        'view_model_get', 'prop_equal', 'blob_seen', 'blob_changed',
+        'vmi_identity', 'prop_identity', 'context_equal', 'context_identity',
     },
     'rive_artboard_v1': {
         'width', 'height', 'bounds', 'node_transform', 'node_world_transform',

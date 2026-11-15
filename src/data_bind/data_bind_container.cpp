@@ -35,6 +35,14 @@ void DataBindContainer::deleteDataBinds()
   }
 }
 
+void DataBindContainer::discardDataBinds()
+{
+  deleteDataBinds();
+  m_dataBinds.clear();
+  m_dirtyDataBinds.clear();
+  m_queues.reset();
+}
+
 void DataBindContainer::unbindDataBinds()
 {
   for (auto& dataBind : m_dataBinds)
@@ -289,6 +297,11 @@ void DataBindContainer::updateDataBind(
                               (d & ComponentDirt::BindingsTarget) ==
                                   ComponentDirt::BindingsTarget);
 
+  // Clear the captured work before either direction can raise new dirt.
+  // In particular, a target-first source validator can queue a correction
+  // that must survive until the next pass.
+  dataBind->dirt(ComponentDirt::None);
+
   if (wantsTargetToSource && !dataBind->sourceToTargetRunsFirst())
   {
 
@@ -296,7 +309,6 @@ void DataBindContainer::updateDataBind(
   }
   if (d != ComponentDirt::None)
   {
-    dataBind->dirt(ComponentDirt::None);
     dataBind->update(d);
   }
   if (wantsTargetToSource && dataBind->sourceToTargetRunsFirst())

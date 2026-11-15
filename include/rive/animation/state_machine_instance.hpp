@@ -298,9 +298,12 @@ public:
   /// The capture phase of a pointer event: this machine's capture listeners
   /// and then those of every machine nested in it, outermost first, all
   /// ahead of the normal phase. A capture listener that includes a press
-  /// type and is hovered on a down claims that pointer's gesture: until its
-  /// release, normal handling under the listener's target -- its hit
-  /// components and whole nested machines -- is off for that pointer.
+  /// type, stops propagation and is hovered on a down claims that pointer's
+  /// gesture: until its release, normal handling under the listener's target
+  /// -- its hit components and whole nested machines -- is off for that
+  /// pointer. Without stopPropagation it only observes the press, though a
+  /// drag type still takes the gesture once it starts dragging, as any drag
+  /// listener here does.
   /// A capture target under an opaque hit drawn above it, from outside its
   /// own target, doesn't fire.
   ///
@@ -590,6 +593,14 @@ public:
   static bool sm_layerAccumulatorEnabled;
 
 #ifdef TESTING
+  // Whether instances made from here on share one bindable among the binds
+  // that always hold the same value (see StateMachine::bindableTwins). On by
+  // default.
+  static bool sm_shareBindables;
+  // Whether a layer whose held pose a change unsettled searches before it
+  // re-applies the pose, and stays as it is when the search changes
+  // nothing. On by default.
+  static bool sm_searchBeforeReapply;
   // Whether a layer going back to the state it just left reuses that
   // state's instance (see StateInstance::restart). On by default.
   static bool sm_reuseStateInstances;
@@ -629,6 +640,14 @@ public:
   // Machines visited by capturePointer, across every instance. Stays put
   // while nothing in the process has a capture listener.
   static uint64_t sm_capturePassVisits;
+  // Advances advanceAndApply(float) skipped, across every instance, because
+  // the machine had settled with only its scripts' async work outstanding
+  // and nothing woke it since (see Artboard::markQuietAwaitingAsync).
+  static uint64_t sm_asyncSkips;
+  // Whether each skipped advance runs anyway and stops loudly if it did
+  // work, as ArtboardComponentList::sm_verifyQuietRows does for quiet rows.
+  // On by default.
+  static bool sm_verifyAsyncSkips;
 #endif
   void enablePointerEvents(int pointerId = 0);
   void disablePointerEvents(int pointerId = 0);
@@ -685,6 +704,10 @@ private:
   bool m_captureRunByHost : 1;
   // See inPointerMiss.
   bool m_inPointerMiss : 1;
+  // The last advanceAndApply(float) settled with only its scripts' async
+  // work outstanding and marked the artboard quiet, so frames skip the
+  // advance until something wakes it (see skipWhileAwaitingAsync).
+  bool m_awaitingAsync : 1;
   // The artboard's changeSerial() when the last advance started. A layer
   // resting on a pose re-applies it only if the serial moved since then
   // (see StateMachineLayerInstance::isFrozen).
@@ -766,6 +789,22 @@ private:
   const Artboard* rootArtboard() const;
 
   void processSemanticEvents();
+
+public:
+  // Whether a transition condition of this machine runs a script. Its
+  // answer reads script state that changes without any dirt or report, so
+  // its layers search every frame (see StateMachine::readsPendingChanges'
+  // settle-safety) and nothing could wake a skipped one.
+  bool ownsScriptedConditions() const;
+
+private:
+  // advanceAndApply(float) settled with only its scripts' async work
+  // keeping it going: marks the artboard so any change wakes it.
+  void armAwaitingAsync();
+  // Whether advanceAndApply(float) can skip this frame's advance: armed, and
+  // nothing woke the artboard, queued work here or moved the view model
+  // change sequence since, while the async work is still out.
+  bool skipWhileAwaitingAsync(float seconds);
 
 #ifdef WITH_RIVE_TOOLS
 public:

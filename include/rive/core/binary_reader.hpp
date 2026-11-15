@@ -9,6 +9,7 @@
 
 namespace rive
 {
+class DataResolver;
 class BinaryReader
 {
 private:
@@ -16,6 +17,7 @@ private:
   const uint8_t* m_Position;
   bool m_Overflowed;
   bool m_IntRangeError;
+  DataResolver* m_dataResolver = nullptr;
 
   void overflow();
   void intRangeError();
@@ -30,6 +32,8 @@ public:
 
   size_t lengthInBytes() const;
   const uint8_t* position() const;
+  /// One past the last byte the reader can read.
+  const uint8_t* endPosition() const { return m_Bytes.end(); }
 
   std::string readString();
   std::string readString(size_t length);
@@ -69,6 +73,12 @@ public:
     }
     return count;
   }
+
+  /// The file's manifest, once it has decoded, so a property that indexes
+  /// its names can resolve while the object is deserialized. Null before
+  /// then, and in a file without one.
+  DataResolver* dataResolver() const { return m_dataResolver; }
+  void dataResolver(DataResolver* value) { m_dataResolver = value; }
 };
 } // namespace rive
 

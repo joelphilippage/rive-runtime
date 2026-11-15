@@ -1,5 +1,6 @@
 #include "rive/artboard.hpp"
 #include "rive/artboard_clusters.hpp"
+#include "rive/deferred_artboard_body.hpp"
 #include "rive/data_bind/host_data_context_consumer.hpp"
 #include "rive/file.hpp"
 #ifdef WITH_RIVE_SCRIPTING_WASM
@@ -136,6 +137,13 @@ Artboard::Artboard(Factory* factory) : m_Factory(factory) { m_Clip = true; }
 
 Artboard::~Artboard()
 {
+  // A body the import deferred and nothing decoded: none of it was imported,
+  // so only its bytes go. What stood in for a body that failed goes too.
+  if (ArtboardSourceState* state = m_sourceState.get())
+  {
+    delete state->deferral.body.exchange(nullptr);
+    delete state->deferral.standIn;
+  }
   // The boundary node can outlive this artboard: a virtualized list row
   // destroyed from the pool never leaves the semantic tree. Flattening reads
   // this pointer to see whether the host is collapsed, so it must not dangle.
@@ -442,6 +450,14 @@ StatusCode Artboard::initialize()
         return code;
       }
     }
+    for (auto animation : ownAnimations())
+    {
+      if (animation->hasKeyFrameBinds())
+      {
+        m_sourceState.ensureAllocated()->hasKeyFrameBinds = true;
+        break;
+      }
+    }
     if (ownAnimations().empty() && ownStateMachines().empty())
     {
       auto sm = new StateMachine();
@@ -453,6 +469,9 @@ StatusCode Artboard::initialize()
   // Store a map of the drawRules to make it easier to lookup the matching
   // rule for a transform component.
   std::unordered_map<Core*, DrawRules*> componentDrawRules;
+  // Each rule with the index of the component that owns it in m_Objects, so
+  // the rules can be ordered by owner without looking up every object.
+  std::vector<std::pair<size_t, DrawRules*>> ownedRules;
 
 #ifdef WITH_RIVE_EDITOR
   // Editor builds move typed-child registration (paths on shapes,
@@ -505,6 +524,18 @@ StatusCode Artboard::initialize()
         if (component != nullptr)
         {
           componentDrawRules[component] = rules;
+          size_t index = static_cast<uint32_t>(rules->parentId());
+          if (index >= m_Objects.size() || m_Objects[index] != component)
+          {
+            // Resolved somewhere other than the index its id names (an
+            // editor object), so find where it sits.
+            index = std::find(m_Objects.begin(), m_Objects.end(), component) -
+                    m_Objects.begin();
+          }
+          if (index < m_Objects.size())
+          {
+            ownedRules.emplace_back(index, rules);
+          }
         }
         else
         {
@@ -618,14 +649,18 @@ StatusCode Artboard::initialize()
         }
       }
 
-      for (ContainerComponent* parent = drawable; parent != nullptr;
-           parent = parent->parent())
+      // Most artboards have no draw rules, so nothing to find.
+      if (!componentDrawRules.empty())
       {
-        auto itr = componentDrawRules.find(parent);
-        if (itr != componentDrawRules.end())
+        for (ContainerComponent* parent = drawable; parent != nullptr;
+             parent = parent->parent())
         {
-          drawable->flattenedDrawRules = itr->second;
-          break;
+          auto itr = componentDrawRules.find(parent);
+          if (itr != componentDrawRules.end())
+          {
+            drawable->flattenedDrawRules = itr->second;
+            break;
+          }
         }
       }
     }
@@ -642,61 +677,63 @@ StatusCode Artboard::initialize()
 
   sortDependencies();
 
-  std::vector<DrawRules*> rulesList;
-  // Build the rules in the right order. We use the map componentDrawRules
-  // to make sure we traverse the objects in the right order from parent
-  // to child, and add the rules accordingly.
-  for (auto object : m_Objects)
+  if (!ownedRules.empty())
   {
-    if (object == nullptr)
+    // Build the rules in the order of the components that own them, from
+    // parent to child. An owner given more than one rule keeps the last, as
+    // componentDrawRules does.
+    std::stable_sort(
+        ownedRules.begin(),
+        ownedRules.end(),
+        [](const std::pair<size_t, DrawRules*>& a,
+           const std::pair<size_t, DrawRules*>& b) {
+          return a.first < b.first;
+        });
+    std::vector<DrawRules*> rulesList;
+    rulesList.reserve(ownedRules.size());
+    for (size_t i = 0; i < ownedRules.size(); i++)
     {
-      continue;
-    }
-    auto itr = componentDrawRules.find(object);
-    if (itr != componentDrawRules.end())
-    {
-      rulesList.emplace_back(componentDrawRules[object]);
-    }
-  }
-  DrawTarget root;
-  // Build up the draw order. Look for draw targets and build
-  // their dependencies.
-  for (auto rules : rulesList)
-  {
-    for (auto child : rules->children())
-    {
-      auto target = child->as<DrawTarget>();
-      root.addDependent(target);
-      auto dependentRules = target->drawable()->flattenedDrawRules;
-      if (dependentRules != nullptr)
+      if (i + 1 < ownedRules.size() &&
+          ownedRules[i + 1].first == ownedRules[i].first)
       {
-        // Because we don't store targets on rules, we need
-        // to find the targets that belong to this rule
-        // here.
-        for (auto object : m_Objects)
+        continue;
+      }
+      rulesList.push_back(ownedRules[i].second);
+    }
+    DrawTarget root;
+    // Build up the draw order. Look for draw targets and build
+    // their dependencies.
+    for (auto rules : rulesList)
+    {
+      for (auto child : rules->children())
+      {
+        auto target = child->as<DrawTarget>();
+        root.addDependent(target);
+        auto dependentRules = target->drawable()->flattenedDrawRules;
+        if (dependentRules != nullptr)
         {
-          if (object != nullptr && object->is<DrawTarget>())
+          // A rule's targets are its children.
+          for (auto dependentChild : dependentRules->children())
           {
-            DrawTarget* dependentTarget = object->as<DrawTarget>();
-            if (dependentTarget->parent() == dependentRules)
+            if (dependentChild->is<DrawTarget>())
             {
-              dependentTarget->addDependent(target);
+              dependentChild->as<DrawTarget>()->addDependent(target);
             }
           }
         }
       }
     }
-  }
-  DependencySorter sorter;
-  std::vector<Component*> drawTargetOrder;
-  sorter.sort(&root, drawTargetOrder);
-  if (drawTargetOrder.size() > 0)
-  {
-    auto itr = drawTargetOrder.begin();
-    itr++;
-    while (itr != drawTargetOrder.end())
+    DependencySorter sorter;
+    std::vector<Component*> drawTargetOrder;
+    sorter.sort(&root, drawTargetOrder);
+    if (drawTargetOrder.size() > 0)
     {
-      m_DrawTargets.push_back(static_cast<DrawTarget*>(*itr++));
+      auto itr = drawTargetOrder.begin();
+      itr++;
+      while (itr != drawTargetOrder.end())
+      {
+        m_DrawTargets.push_back(static_cast<DrawTarget*>(*itr++));
+      }
     }
   }
 
@@ -1601,6 +1638,11 @@ static bool converterRunsScript(DataConverter* converter)
 
 bool Artboard::usesScripts() const
 {
+  const Artboard* source = decoded();
+  if (source != this)
+  {
+    return source->usesScripts();
+  }
   for (auto* object : m_Objects)
   {
     if (object != nullptr && ScriptedObject::from(object) != nullptr)
@@ -1629,17 +1671,12 @@ bool Artboard::usesScripts() const
       return true;
     }
   }
-  // An instance's binds on keyframes stay on its source; its animations
-  // clone them, converters included, as they apply.
-  const Artboard* source = artboardSource();
-  if (source != nullptr && source != this && source->hasKeyFrameSourceBinds())
+  for (auto* animation : animationSource()->ownAnimations())
   {
-    for (const auto& entry : source->m_sourceState.get()->keyFrameBinds)
+    // Without decoding a deferred body.
+    if (animation->anyKeyFrameBindConverter(converterRunsScript))
     {
-      if (converterRunsScript(entry.second->converter()))
-      {
-        return true;
-      }
+      return true;
     }
   }
   return false;
@@ -1983,6 +2020,26 @@ void Artboard::markHostedQuiet()
   }
 }
 
+bool Artboard::markQuietAwaitingAsync()
+{
+  // Settled, the scene's advance would do nothing, scripts included; what's
+  // left is to hear every change that could undo that. A bind this polls,
+  // or a change still waiting in a queue, would not wake it.
+  if (m_host != nullptr || hasDirt(ComponentDirt::Components) ||
+      !m_dirtyLayout.empty() || m_hostTransformMarkedDirty ||
+      m_instanceValueBindsPending || hasDataBindWork() ||
+      !hostedSkippableWhileCollapsed())
+  {
+    return false;
+  }
+  // Rows and collapsed nested artboards mark their trees the same way, so
+  // the wakes already route here (see wakeQuietRow), and a root, with no
+  // host to tell, just drops the mark.
+  m_quietHostRow = 0;
+  markHostedQuiet();
+  return true;
+}
+
 bool Artboard::hostedSkippableWhileCollapsed() const
 {
   // The hosts that aren't nested artboards or lists are artboard paints.
@@ -2030,6 +2087,7 @@ template <typename T> const std::vector<T>& emptySourceList()
 
 const std::vector<LinearAnimation*>& Artboard::ownAnimations() const
 {
+  RIVE_ASSERT_ARTBOARD_BODY();
   const ArtboardSourceState* state = m_sourceState.get();
   return state != nullptr ? state->animations
                           : emptySourceList<LinearAnimation*>();
@@ -2037,9 +2095,147 @@ const std::vector<LinearAnimation*>& Artboard::ownAnimations() const
 
 const std::vector<StateMachine*>& Artboard::ownStateMachines() const
 {
+  RIVE_ASSERT_ARTBOARD_BODY();
   const ArtboardSourceState* state = m_sourceState.get();
   return state != nullptr ? state->stateMachines
                           : emptySourceList<StateMachine*>();
+}
+
+bool Artboard::hasDeferredBody() const
+{
+  const ArtboardSourceState* state = m_sourceState.get();
+  return state != nullptr &&
+         state->deferral.body.load(std::memory_order_acquire) != nullptr;
+}
+
+void Artboard::ensureDecoded() const
+{
+  if (hasDeferredBody())
+  {
+    // The decode checks again under its lock: another thread may be
+    // decoding it right now.
+    m_sourceState.get()->deferral.file->decodeArtboardBody(
+        const_cast<Artboard*>(this));
+  }
+}
+
+const Artboard* Artboard::decoded() const
+{
+  ensureDecoded();
+  // Once decoded nothing changes it (a failed decode set it before
+  // publishing the body as null), so it reads without the lock.
+  const ArtboardSourceState* state = m_sourceState.get();
+  return state != nullptr && state->deferral.standIn != nullptr
+             ? state->deferral.standIn
+             : this;
+}
+
+bool Artboard::handsOut(const Artboard* artboard) const
+{
+  if (artboard == this)
+  {
+    return true;
+  }
+  // The stand-in is set before the body is published as null.
+  const ArtboardSourceState* state = m_sourceState.get();
+  return artboard != nullptr && state != nullptr && !hasDeferredBody() &&
+         state->deferral.standIn == artboard;
+}
+
+Artboard* Artboard::makeEmptyStandIn() const
+{
+  auto standIn = new Artboard();
+  standIn->copy(*this);
+  standIn->m_Factory = m_Factory;
+  standIn->m_originalWidth = m_originalWidth;
+  standIn->m_originalHeight = m_originalHeight;
+#ifdef WITH_RIVE_TOOLS
+  standIn->m_artboardId = m_artboardId;
+  standIn->m_instanceCount = m_instanceCount;
+#endif
+  // Artboards are always their first object (Component::import).
+  standIn->addObject(standIn);
+  standIn->initialize();
+  return standIn;
+}
+
+bool Artboard::failedToDecode() const
+{
+  const ArtboardSourceState* state = m_sourceState.get();
+  return state != nullptr && state->deferral.failed;
+}
+
+bool Artboard::mayHaveTextStylePaint() const
+{
+  return !hasDeferredBody() || m_sourceState.get()->deferral.hasTextStylePaint;
+}
+
+bool Artboard::mayHaveStateMachineListener() const
+{
+  return !hasDeferredBody() ||
+         m_sourceState.get()->deferral.hasStateMachineListener;
+}
+
+void Artboard::deferBody(
+    File* file,
+    DeferredArtboardBody* body,
+    bool hasTextStylePaint,
+    bool hasStateMachineListener)
+{
+  ArtboardDeferral& deferral = m_sourceState.ensureAllocated()->deferral;
+  assert(deferral.body.load(std::memory_order_relaxed) == nullptr);
+  deferral.file = file;
+  deferral.hasTextStylePaint = hasTextStylePaint;
+  deferral.hasStateMachineListener = hasStateMachineListener;
+  deferral.body.store(body, std::memory_order_release);
+}
+
+void Artboard::discardBody()
+{
+  // The decode failed while reading, before anything was initialized, so
+  // only what the importers handed the artboard needs to go. Objects are
+  // owned by the artboard, keyed objects and layers by their animations and
+  // state machines. View model instances (and their values) are ref counted,
+  // so they stay for the destructor, which releases them with its rejected
+  // objects the way it releases its own.
+  ArtboardSourceState* state = m_sourceState.ensureAllocated();
+  for (size_t i = 1; i < m_Objects.size(); i++)
+  {
+    Core* object = m_Objects[i];
+    if (object == nullptr)
+    {
+      continue;
+    }
+    if (object->is<ViewModelInstance>() || object->is<ViewModelInstanceValue>())
+    {
+      state->invalidObjects.push_back(object);
+      continue;
+    }
+    delete object;
+  }
+  m_Objects.resize(1);
+  discardDataBinds();
+  for (auto animation : state->animations)
+  {
+    delete animation;
+  }
+  state->animations.clear();
+  for (auto stateMachine : state->stateMachines)
+  {
+    delete stateMachine;
+  }
+  state->stateMachines.clear();
+}
+
+const Artboard*& Artboard::decodingArtboard()
+{
+  static thread_local const Artboard* artboard = nullptr;
+  return artboard;
+}
+
+void Artboard::assertBodyAvailable() const
+{
+  assert(!hasDeferredBody() || decodingArtboard() == this);
 }
 
 const std::vector<Core*>& Artboard::ownInvalidObjects() const
@@ -2066,44 +2262,10 @@ void Artboard::clearStateMachines()
 }
 #endif
 
-void Artboard::buildKeyFrameSourceBindsIndex() const
-{
-  ArtboardSourceState* state = m_sourceState.ensureAllocated();
-  state->keyFrameBindsBuilt = true;
-  for (auto dataBind : dataBinds())
-  {
-    auto target = dataBind->target();
-    if (target == nullptr || !target->is<KeyFrame>())
-    {
-      continue;
-    }
-    // A keyframe holds a single value, so keep the first bind per target
-    // (emplace does not overwrite an existing key).
-    state->keyFrameBinds.emplace(target->as<KeyFrame>(), dataBind);
-  }
-}
-
 bool Artboard::hasKeyFrameSourceBinds() const
 {
-  const ArtboardSourceState* state = m_sourceState.get();
-  if (state == nullptr || !state->keyFrameBindsBuilt)
-  {
-    buildKeyFrameSourceBindsIndex();
-    state = m_sourceState.get();
-  }
-  return !state->keyFrameBinds.empty();
-}
-
-DataBind* Artboard::keyFrameSourceBind(const KeyFrame* keyframe) const
-{
-  const ArtboardSourceState* state = m_sourceState.get();
-  if (state == nullptr || !state->keyFrameBindsBuilt)
-  {
-    buildKeyFrameSourceBindsIndex();
-    state = m_sourceState.get();
-  }
-  auto it = state->keyFrameBinds.find(keyframe);
-  return it != state->keyFrameBinds.end() ? it->second : nullptr;
+  const ArtboardSourceState* state = animationSource()->m_sourceState.get();
+  return state != nullptr && state->hasKeyFrameBinds;
 }
 
 void Artboard::host(ArtboardHost* artboardHost)
@@ -2361,6 +2523,7 @@ bool Artboard::updateComponents()
   const int maxSteps = 100;
   int step = 0;
   auto count = m_DependencyOrder.size();
+  bool didUpdate = false;
   while (hasDirt(ComponentDirt::Components) && step < maxSteps)
   {
     m_Dirt = m_Dirt & ~ComponentDirt::Components;
@@ -2404,6 +2567,7 @@ bool Artboard::updateComponents()
       }
       component->m_Dirt = ComponentDirt::None;
       component->update(d);
+      didUpdate = true;
 
       // If the update changed the dirt depth by adding dirt
       // to something before us (in the DAG), early out and
@@ -2414,6 +2578,33 @@ bool Artboard::updateComponents()
       }
     }
     step++;
+  }
+  if (didUpdate)
+  {
+    // A draw can consume the change notification before pending updates
+    // apply. Request another draw if the updates did not already do so.
+    if (!m_didChange)
+    {
+      changed();
+    }
+    // Applied values can make an earlier raster stale, even when a self
+    // transform has already requested a composite-only redraw.
+    ++m_contentRevision;
+    // A cache hit can clear an ancestor's draw flag without visiting this
+    // artboard. Invalidate every enclosing raster and re-arm any cleared
+    // flags, including those beyond an ancestor that is already dirty.
+    for (Artboard* ancestor = parentArtboard(); ancestor != nullptr;
+         ancestor = ancestor->parentArtboard())
+    {
+      if (ancestor->m_didChange)
+      {
+        ++ancestor->m_contentRevision;
+      }
+      else
+      {
+        ancestor->changed();
+      }
+    }
   }
   return true;
 }
@@ -3463,6 +3654,18 @@ bool Artboard::drawMasked(
     DrawingGuard(LayerMask& m) : mask(m) { mask.m_isDrawing = true; }
     ~DrawingGuard() { mask.m_isDrawing = false; }
   } drawingGuard(mask);
+  // Restored rather than cleared: a mask nested in this one's range draws
+  // inside this one's canvas.
+  struct MaskedRangeGuard
+  {
+    Artboard& artboard;
+    bool was;
+    MaskedRangeGuard(Artboard& a) : artboard(a), was(a.m_drawsMaskedRange)
+    {
+      artboard.m_drawsMaskedRange = true;
+    }
+    ~MaskedRangeGuard() { artboard.m_drawsMaskedRange = was; }
+  } maskedRangeGuard(*this);
 
   // canvasContentHost, not deferredCanvasHost: this only needs somewhere to
   // rasterize into. No host means nobody can give us an offscreen frame (a
@@ -3475,13 +3678,8 @@ bool Artboard::drawMasked(
     return false;
   }
 
-  // The same fallback, one step earlier, for a host that can rasterize but
-  // cannot apply the mask. Renderer::applyLayerMask already no-ops there, but
-  // finding out that late is too late: the rasters below are sized to the
-  // content-and-coverage intersection, so the layer would come back unmasked
-  // and *cropped* to a box that only made sense if the mask had been applied.
-  // Bailing here draws the range inline -- unmasked for real, and two
-  // canvases and a composite cheaper.
+  // A host that can rasterize but not compose falls back the same way.
+  // Checked before any canvas is drawn.
   if (!host->supportsLayerMask())
   {
     return false;
@@ -3717,7 +3915,7 @@ bool Artboard::drawMasked(
 
   // Growth is immediate, shrinking waits. Anything rotating or scaling
   // changes the size of its own bounding box every frame, and re-allocating
-  // two GPU textures that often costs far more than carrying one bucket of
+  // three GPU textures that often costs far more than carrying one bucket of
   // slack.
   const offscreen::RasterResize resize = offscreen::decideRasterResize(
       plan.widthPx,
@@ -3738,20 +3936,22 @@ bool Artboard::drawMasked(
   if (mustRaster)
   {
     if (resize.reallocate || mask.m_contentCanvas == nullptr ||
-        mask.m_maskCanvas == nullptr)
+        mask.m_maskCanvas == nullptr || mask.m_resultCanvas == nullptr)
     {
-      mask.m_contentCanvas = host->makeContentCanvas(
-          plan.widthPx,
-          plan.heightPx);
-      mask.m_maskCanvas = host->makeContentCanvas(plan.widthPx, plan.heightPx);
 #ifdef TESTING
       mask.testAllocations++;
 #endif
-    }
-    if (mask.m_contentCanvas == nullptr || mask.m_maskCanvas == nullptr)
-    {
-      mask.releaseCanvases();
-      return false;
+      if (!offscreen::makeLayerMaskCanvases(
+              host,
+              plan.widthPx,
+              plan.heightPx,
+              &mask.m_contentCanvas,
+              &mask.m_maskCanvas,
+              &mask.m_resultCanvas))
+      {
+        mask.releaseCanvases();
+        return false;
+      }
     }
 
     // Sequentially, never nested: DeferredSession::endCanvasContent routes
@@ -3796,30 +3996,21 @@ bool Artboard::drawMasked(
       if (Renderer* r = scope.renderer())
       {
         drawDrawableRange(r, startMarker->prevDrawable(), endMarker);
-        // The mask apply has to be the last draw into this canvas: it
-        // multiplies everything already there, so anything drawn after
-        // it would land unmasked. Issued in the canvas's own pixel
-        // space (the scope's transform is still in effect, so undo it)
-        // because the coverage texture is the same size as the target
-        // and has to line up texel for texel.
-        if (rcp<RenderImage> coverage = host->contentCanvasImage(
-                mask.m_maskCanvas.get()))
-        {
-          r->save();
-          const float inv = 1.0f / plan.rasterScale;
-          r->translate(plan.box.left(), plan.box.top());
-          r->transform(Mat2D::fromScale(inv, inv));
-          r->applyLayerMask(
-              coverage.get(),
-              ImageSampler::LinearClamp(),
-              static_cast<LayerMaskMode>(mask.maskMode()));
-          r->restore();
-        }
       }
       else
       {
         opened = false;
       }
+    }
+    if (opened && !host->composeLayerMask(
+                      mask.m_contentCanvas.get(),
+                      mask.m_maskCanvas.get(),
+                      mask.m_resultCanvas.get(),
+                      static_cast<LayerMaskMode>(mask.maskMode())))
+    {
+      // The content draws inline, unmasked, rather than as a hole.
+      mask.releaseCanvases();
+      return false;
     }
     if (!opened)
     {
@@ -3842,11 +4033,9 @@ bool Artboard::drawMasked(
     mask.m_dirty = false;
   }
 
-  rcp<RenderImage> contentImage = host->contentCanvasImage(
-      mask.m_contentCanvas.get());
-  rcp<RenderImage> coverageImage = host->contentCanvasImage(
-      mask.m_maskCanvas.get());
-  if (contentImage == nullptr || coverageImage == nullptr)
+  rcp<RenderImage> resultImage = host->contentCanvasImage(
+      mask.m_resultCanvas.get());
+  if (resultImage == nullptr)
   {
     return false;
   }
@@ -3861,7 +4050,7 @@ bool Artboard::drawMasked(
       mask.m_rasterScale,
       mask.m_box);
   placement.renderer->drawImage(
-      contentImage.get(),
+      resultImage.get(),
       ImageSampler::LinearClamp(),
       mask.compositeBlendMode(),
       placement.opacity);
@@ -4214,6 +4403,8 @@ bool Artboard::hasAudio() const
 
 bool Artboard::isTranslucent(const LinearAnimation* anim) const
 {
+  // Reads the keyed objects directly, so decode a deferred body first.
+  anim->ensureDecoded();
   // For now we're conservative/lazy -- if we see that any of our paints are
   // animated we assume that might make it non-opaque, so we early out
   for (const auto& obj : anim->m_KeyedObjects)

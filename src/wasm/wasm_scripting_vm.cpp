@@ -152,6 +152,7 @@
 #endif
 
 #ifndef __EMSCRIPTEN__
+#include "system_pages.hpp"
 #include "wasm_export.h"
 #endif
 #include "wasm_utf16.hpp"
@@ -333,6 +334,12 @@ struct rive::WasmScriptingVMNatives
 #endif
   static std::unordered_map<std::string, int64_t>& consoleTimers(
       WasmScriptingVM* vm);
+#ifdef WITH_RIVE_TOOLS
+  static bool& warnedSampledOpenCanvas(WasmScriptingVM* vm)
+  {
+    return vm->m_warnedSampledOpenCanvas;
+  }
+#endif
 };
 
 #ifndef __EMSCRIPTEN__
@@ -800,8 +807,23 @@ namespace
 {
 // Module calls live on this thread, any VM's.
 thread_local uint32_t t_moduleCalls = 0;
+// Where the std's console says the line this thread writes next was called
+// from, until the write takes it.
+thread_local std::string t_consoleFile;
+thread_local uint32_t t_consoleLine = 0;
 using Clock = std::chrono::steady_clock;
 } // namespace
+
+bool WasmScriptingVM::consoleCaller(std::string& file, uint32_t& line)
+{
+  if (t_consoleFile.empty())
+  {
+    return false;
+  }
+  file = t_consoleFile;
+  line = t_consoleLine;
+  return true;
+}
 
 // What the module call on this thread has left of its budget, infinity
 // when nothing bounds it.
@@ -2260,11 +2282,25 @@ std::string consoleString(wasm_exec_env_t env, uint32_t text)
   return std::string(utf8.data(), utf8.size());
 }
 
+void consoleCaller(wasm_exec_env_t env, uint32_t file, int32_t line)
+{
+  if (WasmLane* lane = WasmLane::current())
+  {
+    lane->consoleText(env, file, t_consoleFile);
+  }
+  else
+  {
+    t_consoleFile = consoleString(env, file);
+  }
+  t_consoleLine = line > 0 ? (uint32_t)line : 0;
+}
+
 void consoleLog(wasm_exec_env_t env, uint32_t text)
 {
   if (WasmLane* lane = WasmLane::current())
   {
-    lane->logConsole(env, text);
+    lane->logConsole(env, text, t_consoleFile, t_consoleLine);
+    t_consoleFile.clear();
     return;
   }
   consoleWrite(vmFromEnv(env), consoleString(env, text));
@@ -2315,6 +2351,7 @@ void envTrace(
 }
 
 NativeSymbol kEnvNatives[] = {
+    {"console.caller", (void*)consoleCaller, "(ii)", nullptr},
     {"console.log", (void*)consoleLog, "(i)", nullptr},
     {"console.debug", (void*)consoleLog, "(i)", nullptr},
     {"console.info", (void*)consoleLog, "(i)", nullptr},
@@ -3228,6 +3265,30 @@ HostImage* resolveImage(WasmScriptingVM* vm, uint32_t handle)
       vm->handles().resolve(handle, WasmScriptingVM::HandleTable::Tag::image));
 }
 
+#if defined(WITH_RIVE_TOOLS) && defined(RIVE_CANVAS)
+static void warnIfCanvasFrameOpen(
+    WasmScriptingVM* vm,
+    const Renderer* reader,
+    const HostImage* image)
+{
+  bool& warned = WasmScriptingVMNatives::warnedSampledOpenCanvas(vm);
+  cmd::DeferredCanvasHost* host = vm->factory()->deferredCanvasHost();
+  if (warned || host == nullptr || image->sourceCanvas == nullptr ||
+      !host->canvasContentOpen(image->sourceCanvas.get(), reader))
+  {
+    return;
+  }
+  warned = true;
+  consoleWrite(vm, cmd::kSampledOpenCanvasWarning);
+}
+#else
+static void warnIfCanvasFrameOpen(
+    WasmScriptingVM*,
+    const Renderer*,
+    const HostImage*)
+{}
+#endif
+
 uint32_t imageFromAssetImpl(
     WasmScriptingVM* vm,
     uint32_t objectHandle,
@@ -3280,6 +3341,27 @@ void imageDecodeCancelImpl(WasmScriptingVM* vm, uint32_t token)
   {
     vm->cancelImageDecode(token);
   }
+}
+
+uint32_t imageLoadImpl(
+    WasmScriptingVM* vm,
+    const uint8_t* bytes,
+    uint32_t byteCount)
+{
+  if (vm == nullptr || vm->factory() == nullptr || bytes == nullptr ||
+      byteCount == 0)
+  {
+    return 0;
+  }
+  auto image = vm->factory()->decodeImage(
+      Span<const uint8_t>(bytes, byteCount));
+  if (image == nullptr)
+  {
+    return 0;
+  }
+  return vm->handles().mint(
+      WasmScriptingVM::HandleTable::Tag::image,
+      new HostImage{std::move(image)});
 }
 
 #ifdef RIVE_CANVAS
@@ -4765,31 +4847,13 @@ uint32_t gpuBindGroupLayoutFromShaderImpl(
     const uint32_t* dynamicUBOs,
     uint32_t dynamicUBOCount)
 {
-  ore::Context* oreContext = gpuOreContext(vm);
-  if (oreContext == nullptr)
-  {
-    return 0;
-  }
-  auto host = static_cast<HostGpuShaderModule*>(vm->handles().resolve(
+  return gpuBindGroupLayoutFromShadersImpl(
+      vm,
       shaderModule,
-      WasmScriptingVM::HandleTable::Tag::gpuShaderModule));
-  if (host == nullptr)
-  {
-    return 0;
-  }
-  auto layout = ore::makeBindGroupLayoutFromShader(
-      *oreContext,
-      host->shaderModule.get(),
+      0,
       groupIndex,
       dynamicUBOs,
       dynamicUBOCount);
-  if (layout == nullptr)
-  {
-    return 0;
-  }
-  return vm->handles().mint(
-      WasmScriptingVM::HandleTable::Tag::gpuBindGroupLayout,
-      new HostGpuBindGroupLayout{std::move(layout)});
 }
 
 uint32_t gpuBindGroupLayoutFromShadersImpl(
@@ -4817,17 +4881,19 @@ uint32_t gpuBindGroupLayoutFromShadersImpl(
   {
     return 0;
   }
-  auto layout = ore::makeBindGroupLayoutFromBindingMap(
+  oreContext->clearLastError();
+  auto layout = ore::makeBindGroupLayoutFromShader(
       *oreContext,
-      ore::bindingMapForStages(vertex, fragment),
+      vertex,
       groupIndex,
       dynamicUBOs,
       dynamicUBOCount,
-      vertex,
       fragment);
   if (layout == nullptr)
   {
-    return 0;
+    return oreContext->lastError().empty()
+               ? 0
+               : gpuRejected(vm, oreContext, "GPUBindGroupLayout.fromShader");
   }
   return vm->handles().mint(
       WasmScriptingVM::HandleTable::Tag::gpuBindGroupLayout,
@@ -6109,6 +6175,7 @@ void rendererDrawImageImpl(
   {
     return;
   }
+  warnIfCanvasFrameOpen(vm, renderer, host);
   renderer->drawImage(
       host->image.get(),
       ImageSampler::SamplerFromKey((uint8_t)samplerKey),
@@ -6138,6 +6205,7 @@ void rendererDrawImageMeshImpl(
   {
     return;
   }
+  warnIfCanvasFrameOpen(vm, renderer, image);
   renderer->drawImageMesh(
       image->image.get(),
       ImageSampler::SamplerFromKey((uint8_t)samplerKey),
@@ -6172,6 +6240,7 @@ void rendererDrawImageMeshInstancedImpl(
   {
     return;
   }
+  warnIfCanvasFrameOpen(vm, renderer, image);
   renderer->drawImageMeshInstanced(
       image->image.get(),
       ImageSampler::SamplerFromKey((uint8_t)samplerKey),
@@ -6235,6 +6304,7 @@ void rtLogImpl(
   auto lock = WasmScriptingVMNatives::lockPrint(vm);
   WasmScriptingVMNatives::print(vm, message, length);
   WasmScriptingVMNatives::print(vm, "\n", 1);
+  t_consoleFile.clear();
 }
 
 void rtBudgetExceededImpl(WasmScriptingVM* vm, uint32_t ms)
@@ -6344,6 +6414,15 @@ uint32_t mat4InvertImpl(
   return 1;
 }
 #pragma clang fp contract(on)
+
+void rtReleasePagesImpl(WasmScriptingVM* vm, uint32_t start, uint32_t length)
+{
+  // A module's start function runs before the exec env carries its vm.
+  if (vm != nullptr)
+  {
+    vm->releasePages(start, length);
+  }
+}
 
 uint32_t rtUtcOffsetImpl(WasmScriptingVM* vm, double epochSeconds)
 {
@@ -6465,6 +6544,10 @@ struct HostInstanceValue
   // What string_get last handed the module, for string_changed.
   std::string sent;
   bool hasSent = false;
+  // The bytes id last marked for the handle, 0 for no blob, which
+  // blob_changed compares.
+  uint32_t seenBlob = 0;
+  bool hasSeenBlob = false;
 
   explicit HostInstanceValue(ViewModelInstanceValue* instanceValue)
       : owner(ref_rcp(instanceValue->viewModelInstance()))
@@ -7231,6 +7314,12 @@ uint32_t dataVmiEqualImpl(WasmScriptingVM* vm, uint32_t a, uint32_t b)
   return lhs != nullptr && lhs == rhs ? 1 : 0;
 }
 
+uint32_t dataVmiIdentityImpl(WasmScriptingVM* vm, uint32_t vmiHandle)
+{
+  auto instance = resolveVmiArg(vm, vmiHandle);
+  return instance != nullptr ? instance->stableId() : 0;
+}
+
 void dataListRemoveAllOfImpl(
     WasmScriptingVM* vm,
     uint32_t handle,
@@ -7437,6 +7526,28 @@ uint32_t dataContextViewModelImpl(WasmScriptingVM* vm, uint32_t handle)
 void dataContextReleaseImpl(WasmScriptingVM* vm, uint32_t handle)
 {
   releaseHostHandle(vm, handle, WasmScriptingVM::HandleTable::Tag::dataContext);
+}
+
+static DataContext* resolveDataContext(WasmScriptingVM* vm, uint32_t handle)
+{
+  auto host = vm == nullptr
+                  ? nullptr
+                  : static_cast<HostDataContext*>(vm->handles().resolve(
+                        handle,
+                        WasmScriptingVM::HandleTable::Tag::dataContext));
+  return host != nullptr ? host->context.get() : nullptr;
+}
+
+uint32_t dataContextEqualImpl(WasmScriptingVM* vm, uint32_t a, uint32_t b)
+{
+  auto first = resolveDataContext(vm, a);
+  return first != nullptr && first == resolveDataContext(vm, b) ? 1 : 0;
+}
+
+uint32_t dataContextIdentityImpl(WasmScriptingVM* vm, uint32_t handle)
+{
+  auto context = resolveDataContext(vm, handle);
+  return context != nullptr ? context->stableId() : 0;
 }
 
 // --- rive_artboard_v1: host-owned artboard inputs ---------------------------
@@ -8026,6 +8137,17 @@ struct HostNode
 {
   rcp<HostArtboard> owner;
   TransformComponent* component;
+#ifdef WITH_RIVE_TOOLS
+  // Set in place of component when a host's source backs the node, always
+  // borrowed. The guest reads a path's verbs and points, and a node's child
+  // count and handles, in separate calls, so each is asked for once.
+  WasmNodeSource* source = nullptr;
+  uint32_t sourceId = 0;
+  bool sourcePathRead = false;
+  std::unique_ptr<RawPath> sourcePath;
+  bool sourceChildrenRead = false;
+  std::vector<uint32_t> sourceChildren;
+#endif
 };
 
 uint32_t mintNode(
@@ -8043,6 +8165,47 @@ uint32_t mintNode(
   }
   return handle;
 }
+
+#ifdef WITH_RIVE_TOOLS
+uint32_t mintSourceNode(
+    WasmScriptingVM* vm,
+    WasmNodeSource* source,
+    uint32_t id)
+{
+  auto node = new HostNode{nullptr, nullptr};
+  node->source = source;
+  node->sourceId = id;
+  uint32_t handle = vm->handles().mint(
+      WasmScriptingVM::HandleTable::Tag::node,
+      node);
+  vm->scopedNodes().push_back(handle);
+  return handle;
+}
+
+const RawPath* sourceNodePath(HostNode* host)
+{
+  if (!host->sourcePathRead)
+  {
+    host->sourcePathRead = true;
+    auto path = std::make_unique<RawPath>();
+    if (host->source->path(host->sourceId, *path))
+    {
+      host->sourcePath = std::move(path);
+    }
+  }
+  return host->sourcePath.get();
+}
+
+const std::vector<uint32_t>& sourceNodeChildren(HostNode* host)
+{
+  if (!host->sourceChildrenRead)
+  {
+    host->sourceChildrenRead = true;
+    host->source->children(host->sourceId, host->sourceChildren);
+  }
+  return host->sourceChildren;
+}
+#endif
 
 uint32_t artboardNodeImpl(
     WasmScriptingVM* vm,
@@ -8116,6 +8279,44 @@ uint32_t artboardGamepadEventImpl(
       dispatched);
 }
 
+// The Luau artboard:keyboardEvent/textEvent path: keys and text go to the
+// artboard's focused control through its own focus manager.
+uint32_t artboardKeyboardEventImpl(
+    WasmScriptingVM* vm,
+    uint32_t handle,
+    uint32_t key,
+    uint32_t modifiers,
+    uint32_t isPressed,
+    uint32_t isRepeat)
+{
+  auto host = resolveArtboard(vm, handle);
+  if (host == nullptr || host->stateMachine == nullptr)
+  {
+    return 0;
+  }
+  return host->stateMachine->keyInput(
+             (Key)(uint16_t)key,
+             (KeyModifiers)(uint8_t)modifiers,
+             isPressed != 0,
+             isRepeat != 0)
+             ? 1
+             : 0;
+}
+
+uint32_t artboardTextEventImpl(
+    WasmScriptingVM* vm,
+    uint32_t handle,
+    const char* text,
+    uint32_t length)
+{
+  auto host = resolveArtboard(vm, handle);
+  if (host == nullptr || host->stateMachine == nullptr)
+  {
+    return 0;
+  }
+  return host->stateMachine->textInput(std::string(text, length)) ? 1 : 0;
+}
+
 HostNode* resolveNode(WasmScriptingVM* vm, uint32_t handle)
 {
   if (vm == nullptr)
@@ -8156,6 +8357,13 @@ void artboardNodeTransformImpl(
     memcpy(out, identity, sizeof(identity));
     return;
   }
+#ifdef WITH_RIVE_TOOLS
+  if (host->source != nullptr)
+  {
+    host->source->transform(host->sourceId, out);
+    return;
+  }
+#endif
   out[0] = host->component->x();
   out[1] = host->component->y();
   out[2] = host->component->rotation();
@@ -8200,6 +8408,13 @@ void artboardNodeSetImpl(
   {
     return;
   }
+#ifdef WITH_RIVE_TOOLS
+  if (host->source != nullptr)
+  {
+    host->source->set(host->sourceId, field, v0, v1);
+    return;
+  }
+#endif
   TransformComponent* component = host->component;
   switch (field)
   {
@@ -8240,6 +8455,13 @@ void artboardNodeWorldTransformImpl(
     return;
   }
   auto host = resolveNode(vm, handle);
+#ifdef WITH_RIVE_TOOLS
+  if (host != nullptr && host->source != nullptr)
+  {
+    host->source->worldTransform(host->sourceId, out);
+    return;
+  }
+#endif
   Mat2D world = host != nullptr ? host->component->worldTransform() : Mat2D();
   for (int i = 0; i < 6; i++)
   {
@@ -8258,6 +8480,13 @@ void artboardNodeSetWorldTransformImpl(
   {
     return;
   }
+#ifdef WITH_RIVE_TOOLS
+  if (host->source != nullptr)
+  {
+    host->source->setWorldTransform(host->sourceId, values);
+    return;
+  }
+#endif
   host->component->mutableWorldTransform() = Mat2D(
       values[0],
       values[1],
@@ -8278,6 +8507,13 @@ void artboardNodeDecomposeImpl(
   {
     return;
   }
+#ifdef WITH_RIVE_TOOLS
+  if (host->source != nullptr)
+  {
+    host->source->decompose(host->sourceId, values);
+    return;
+  }
+#endif
   TransformComponent* component = host->component;
   Mat2D world = getParentWorld(*component).invertOrIdentity() * Mat2D(
                                                                     values[0],
@@ -8294,21 +8530,39 @@ void artboardNodeDecomposeImpl(
   component->rotation(components.rotation());
 }
 
+// Null when the node is stale or not a path.
+const RawPath* nodeRawPath(WasmScriptingVM* vm, uint32_t handle)
+{
+  auto host = resolveNode(vm, handle);
+  if (host == nullptr)
+  {
+    return nullptr;
+  }
+#ifdef WITH_RIVE_TOOLS
+  if (host->source != nullptr)
+  {
+    return sourceNodePath(host);
+  }
+#endif
+  if (!host->component->is<Path>())
+  {
+    return nullptr;
+  }
+  return &host->component->as<Path>()->rawPath();
+}
+
 uint32_t artboardNodePathVerbsImpl(
     WasmScriptingVM* vm,
     uint32_t handle,
     uint8_t* out,
     uint32_t outCount)
 {
-  auto host = resolveNode(vm, handle);
-  if (host == nullptr || !host->component->is<Path>())
+  auto rawPath = nodeRawPath(vm, handle);
+  if (rawPath == nullptr)
   {
     return ~0u;
   }
-  return fillOut(
-      pathVerbBytes(host->component->as<Path>()->rawPath()),
-      out,
-      outCount);
+  return fillOut(pathVerbBytes(*rawPath), out, outCount);
 }
 
 uint32_t artboardNodePathPointsImpl(
@@ -8317,15 +8571,12 @@ uint32_t artboardNodePathPointsImpl(
     float* out,
     uint32_t outCount)
 {
-  auto host = resolveNode(vm, handle);
-  if (host == nullptr || !host->component->is<Path>())
+  auto rawPath = nodeRawPath(vm, handle);
+  if (rawPath == nullptr)
   {
     return ~0u;
   }
-  return fillOut(
-      pathFloats(host->component->as<Path>()->rawPath()),
-      out,
-      outCount);
+  return fillOut(pathFloats(*rawPath), out, outCount);
 }
 
 uint32_t artboardNodePaintImpl(
@@ -8335,7 +8586,9 @@ uint32_t artboardNodePaintImpl(
     uint32_t outCount)
 {
   auto host = resolveNode(vm, handle);
-  if (host == nullptr || !host->component->is<ShapePaint>() || outCount < 7)
+  // A source backed node is a shape or one of its kin, never a paint.
+  if (host == nullptr || host->component == nullptr ||
+      !host->component->is<ShapePaint>() || outCount < 7)
   {
     return 0;
   }
@@ -8384,7 +8637,28 @@ uint32_t artboardNodeChildrenImpl(
     uint32_t outCount)
 {
   auto host = resolveNode(vm, handle);
-  if (host == nullptr || !host->component->is<ContainerComponent>())
+  if (host == nullptr)
+  {
+    return 0;
+  }
+#ifdef WITH_RIVE_TOOLS
+  if (host->source != nullptr)
+  {
+    WasmNodeSource* source = host->source;
+    const std::vector<uint32_t>& ids = sourceNodeChildren(host);
+    uint32_t idCount = (uint32_t)ids.size();
+    if (idCount > outCount)
+    {
+      return idCount;
+    }
+    for (uint32_t i = 0; i < idCount; i++)
+    {
+      out[i] = mintSourceNode(vm, source, ids[i]);
+    }
+    return idCount;
+  }
+#endif
+  if (!host->component->is<ContainerComponent>())
   {
     return 0;
   }
@@ -8419,6 +8693,13 @@ uint32_t artboardNodeParentImpl(WasmScriptingVM* vm, uint32_t handle)
   {
     return 0;
   }
+#ifdef WITH_RIVE_TOOLS
+  if (host->source != nullptr)
+  {
+    uint32_t parentId = host->source->parent(host->sourceId);
+    return parentId == 0 ? 0 : mintSourceNode(vm, host->source, parentId);
+  }
+#endif
   auto parent = host->component->parent();
   if (parent == nullptr || !parent->is<TransformComponent>())
   {
@@ -9181,6 +9462,26 @@ rcp<FileAsset> resolveBlobAsset(WasmScriptingVM* vm, uint32_t handle)
   return nullptr;
 }
 
+uint32_t readBlobBytes(
+    Span<const uint8_t> bytes,
+    uint32_t offset,
+    uint8_t* out,
+    uint32_t capacity)
+{
+  if (offset >= bytes.size())
+  {
+    return 0;
+  }
+  uint32_t count = (uint32_t)std::min<size_t>(capacity, bytes.size() - offset);
+  memcpy(out, bytes.data() + offset, count);
+  return count;
+}
+
+bool blobHasBytes(FileAsset* blob)
+{
+  return !blob->as<BlobAsset>()->bytes().empty();
+}
+
 uint32_t blobAssetBytesImpl(
     WasmScriptingVM* vm,
     uint32_t objectHandle,
@@ -9194,7 +9495,7 @@ uint32_t blobAssetBytesImpl(
       objectHandle,
       name,
       nameLength,
-      [](FileAsset* blob) { return !blob->as<BlobAsset>()->bytes().empty(); });
+      blobHasBytes);
   if (asset == nullptr)
   {
     return 0;
@@ -9207,12 +9508,35 @@ uint32_t blobAssetBytesImpl(
   return (uint32_t)bytes.size();
 }
 
-// --- rive_file_v1 and artboard properties: context:decodeFile ---------------
+uint32_t blobAssetReadImpl(
+    WasmScriptingVM* vm,
+    uint32_t objectHandle,
+    const char* name,
+    uint32_t nameLength,
+    uint32_t offset,
+    uint8_t* out,
+    uint32_t outByteCount)
+{
+  auto asset = findFileAsset<BlobAsset>(
+      vm,
+      objectHandle,
+      name,
+      nameLength,
+      blobHasBytes);
+  if (asset == nullptr)
+  {
+    return 0;
+  }
+  return readBlobBytes(asset->bytes(), offset, out, outByteCount);
+}
+
+// --- rive_file_v1 and artboard properties -----------------------------------
 //
-// The Luau lane's decodeFile, RiveFile, BindableArtboard and
-// Property<BindableArtboard> (lua_rive_file.cpp, ScriptedPropertyArtboard),
-// with the file and its bindables held host side. Like the Luau lane they
-// exist only where fetch() does; elsewhere every op answers none.
+// The Luau lane's decodeFile, RiveFile, BindableArtboard,
+// context:bindableArtboard and Property<BindableArtboard> (lua_rive_file.cpp,
+// ScriptedPropertyArtboard), with the file and its bindables held host side.
+// Like the Luau lane, only decodeFile needs fetch()'s build; elsewhere it
+// answers unavailable while the host file's own artboards still bind.
 
 struct HostRiveFile
 {
@@ -9318,7 +9642,7 @@ uint32_t fileArtboardNameImpl(
   }
   return fillModuleString(
       vm,
-      host->file->artboard(index)->name(),
+      host->file->artboardHeader(index)->name(),
       buffer,
       capacity);
 }
@@ -9369,7 +9693,7 @@ uint32_t fileBindableNameImpl(
   }
   return fillModuleString(
       vm,
-      host->artboard->artboard()->name(),
+      host->artboard->source()->name(),
       buffer,
       capacity);
 }
@@ -9396,25 +9720,57 @@ uint32_t fileBindableEqualImpl(WasmScriptingVM* vm, uint32_t a, uint32_t b)
              : 0;
 }
 
+uint32_t fileBindableIdentityImpl(WasmScriptingVM* vm, uint32_t bindable)
+{
+  auto host = resolveBindableArtboard(vm, bindable);
+  return host != nullptr ? host->artboard->stableId() : 0;
+}
+
+// context.bindableArtboard: one of the script's own file's artboards, with no
+// view model of its own, so the host binds it as an authored artboard id.
+uint32_t fileHostBindableImpl(
+    WasmScriptingVM* vm,
+    uint32_t objectHandle,
+    const char* name,
+    uint32_t nameLength,
+    uint32_t useDefault)
+{
+  if (vm == nullptr)
+  {
+    return 0;
+  }
+  auto object = static_cast<ScriptedObject*>(vm->handles().resolve(
+      objectHandle,
+      WasmScriptingVM::HandleTable::Tag::object));
+  if (object == nullptr || object->scriptAsset() == nullptr ||
+      object->scriptAsset()->file() == nullptr)
+  {
+    return 0;
+  }
+  std::string named(name, nameLength);
+  auto bindable = hostBindableArtboard(
+      *object->scriptAsset()->file(),
+      useDefault != 0 ? nullptr : named.c_str());
+  if (bindable == nullptr)
+  {
+    return 0;
+  }
+  return vm->handles().mint(
+      WasmScriptingVM::HandleTable::Tag::bindableArtboard,
+      new HostBindableArtboard{std::move(bindable), nullptr});
+}
+
 uint32_t dataVmiArtboardImpl(
     WasmScriptingVM* vm,
     uint32_t vmiHandle,
     const char* name,
     uint32_t length)
 {
-#ifdef WITH_RIVE_SCRIPTNET
   return mintInstanceValue<ViewModelInstanceArtboard>(
       vm,
       vmiHandle,
       name,
       length);
-#else
-  (void)vm;
-  (void)vmiHandle;
-  (void)name;
-  (void)length;
-  return 0;
-#endif
 }
 
 // Mirrors ScriptedPropertyArtboard::pushValue: nil while the property names
@@ -10285,6 +10641,25 @@ uint32_t dataBlobGetImpl(
   return (uint32_t)bytes.size();
 }
 
+uint32_t dataBlobReadImpl(
+    WasmScriptingVM* vm,
+    uint32_t handle,
+    uint32_t offset,
+    uint8_t* out,
+    uint32_t outByteCount)
+{
+  auto asset = resolveBlobAsset(vm, handle);
+  if (asset == nullptr)
+  {
+    return 0;
+  }
+  return readBlobBytes(
+      asset->as<BlobAsset>()->bytes(),
+      offset,
+      out,
+      outByteCount);
+}
+
 uint32_t dataBlobNameImpl(
     WasmScriptingVM* vm,
     uint32_t handle,
@@ -10297,6 +10672,28 @@ uint32_t dataBlobNameImpl(
     return 0;
   }
   return fillModuleString(vm, asset->name(), buffer, capacity);
+}
+
+HostInstanceValue* resolveHostValue(WasmScriptingVM* vm, uint32_t handle)
+{
+  if (vm == nullptr)
+  {
+    return nullptr;
+  }
+  return static_cast<HostInstanceValue*>(vm->handles().resolve(
+      handle,
+      WasmScriptingVM::HandleTable::Tag::instanceValue));
+}
+
+// bytesId is the blob the module's copy for the handle came from, 0 for none.
+void markBlobSeen(WasmScriptingVM* vm, uint32_t handle, uint32_t bytesId)
+{
+  auto host = resolveHostValue(vm, handle);
+  if (host != nullptr)
+  {
+    host->seenBlob = bytesId;
+    host->hasSeenBlob = true;
+  }
 }
 
 void dataBlobSetImpl(
@@ -10313,6 +10710,8 @@ void dataBlobSetImpl(
   auto asset = make_rcp<BlobAsset>();
   SimpleArray<uint8_t> data(bytes, byteCount);
   asset->decode(data, nullptr);
+  // Marked before the listeners run, so a blob one of them sets shows.
+  markBlobSeen(vm, handle, asset->bytesId());
   value->value(asset.get());
 }
 
@@ -10321,19 +10720,61 @@ void dataBlobClearImpl(WasmScriptingVM* vm, uint32_t handle)
   auto value = resolveInstanceValue<ViewModelInstanceAssetBlob>(vm, handle);
   if (value != nullptr)
   {
+    markBlobSeen(vm, handle, 0);
     value->value(nullptr);
   }
 }
 
-HostInstanceValue* resolveHostValue(WasmScriptingVM* vm, uint32_t handle)
+uint32_t dataPropEqualImpl(WasmScriptingVM* vm, uint32_t a, uint32_t b)
 {
-  if (vm == nullptr)
+  auto first = resolveHostValue(vm, a);
+  auto second = resolveHostValue(vm, b);
+  return first != nullptr && second != nullptr && first->value == second->value
+             ? 1
+             : 0;
+}
+
+uint32_t dataPropIdentityImpl(WasmScriptingVM* vm, uint32_t handle)
+{
+  auto host = resolveHostValue(vm, handle);
+  if (host == nullptr)
   {
-    return nullptr;
+    return 0;
   }
-  return static_cast<HostInstanceValue*>(vm->handles().resolve(
-      handle,
-      WasmScriptingVM::HandleTable::Tag::instanceValue));
+  // Its instance's id and its own within the instance, spread by the odd
+  // multiplier so both reach the low bits a Map picks a bucket from. The
+  // owner, since an editor build can part a retained value from its instance.
+  uint32_t instanceId = host->owner != nullptr ? host->owner->stableId() : 0;
+  return instanceId * 2654435761u + host->value->viewModelPropertyId();
+}
+
+uint32_t blobBytesId(WasmScriptingVM* vm, uint32_t handle)
+{
+  auto asset = resolveBlobAsset(vm, handle);
+  return asset != nullptr ? asset->as<BlobAsset>()->bytesId() : 0;
+}
+
+void dataBlobSeenImpl(WasmScriptingVM* vm, uint32_t handle)
+{
+  markBlobSeen(vm, handle, blobBytesId(vm, handle));
+}
+
+enum BlobChange : uint32_t
+{
+  same,
+  changed,
+  noProperty,
+};
+
+uint32_t dataBlobChangedImpl(WasmScriptingVM* vm, uint32_t handle)
+{
+  if (resolveInstanceValue<ViewModelInstanceAssetBlob>(vm, handle) == nullptr)
+  {
+    return BlobChange::noProperty;
+  }
+  auto host = resolveHostValue(vm, handle);
+  bool seen = host->hasSeenBlob && host->seenBlob == blobBytesId(vm, handle);
+  return seen ? BlobChange::same : BlobChange::changed;
 }
 
 void dataWatchImpl(WasmScriptingVM* vm, uint32_t handle, uint32_t token)
@@ -12073,6 +12514,7 @@ void WasmScriptingVM::deliverDecodeResult(const DecodeResult& result)
     {
       guestFree(pixelsPtr);
     }
+    asyncWorkDelivered();
     return;
   }
   uint32_t messagePtr = guestString(result.error.c_str());
@@ -12083,6 +12525,7 @@ void WasmScriptingVM::deliverDecodeResult(const DecodeResult& result)
   uint32_t args[3] = {m_L, result.token, messagePtr};
   callModule("host_image_decode_failed", 3, args);
   guestFree(messagePtr);
+  asyncWorkDelivered();
 }
 
 void WasmScriptingVM::resolveImageDecode(
@@ -12305,6 +12748,7 @@ void WasmScriptingVM::resolveFetch(
   uint32_t args[4] = {m_L, token, responsePtr, byteCount};
   callModule("host_fetch_resolved", 4, args);
   guestFree(responsePtr);
+  asyncWorkDelivered();
 }
 
 void WasmScriptingVM::rejectFetch(
@@ -12337,6 +12781,7 @@ void WasmScriptingVM::deliverFetchFailure(
   uint32_t args[4] = {m_L, token, code, messagePtr};
   callModule("host_fetch_failed", 4, args);
   guestFree(messagePtr);
+  asyncWorkDelivered();
 }
 
 bool WasmScriptingVM::inModuleCall() const { return m_callDepth != 0; }
@@ -12431,9 +12876,16 @@ void WasmScriptingVM::deliverAllLaneOutput()
   });
 }
 
-static void printLaneLine(void* vm, std::string_view line)
+// Names the line by its lane's call site, as the main lane's console does.
+static void printLaneLine(
+    void* vm,
+    std::string_view file,
+    uint32_t line,
+    std::string_view text)
 {
-  rtLogImpl((WasmScriptingVM*)vm, 0, line.data(), (uint32_t)line.size());
+  t_consoleFile.assign(file.data(), file.size());
+  t_consoleLine = line;
+  rtLogImpl((WasmScriptingVM*)vm, 0, text.data(), (uint32_t)text.size());
 }
 
 void WasmScriptingVM::watchLanes()
@@ -12781,6 +13233,7 @@ void WasmScriptingVM::wakeMain(uint32_t token, double value)
     double args[3] = {(double)m_L, (double)token, value};
     double unused = 0;
     callF64("host_lane_wake", args, 3, &unused);
+    asyncWorkDelivered();
   });
 }
 
@@ -12900,6 +13353,26 @@ void WasmScriptingVM::deliverHeldOutcomes()
 void WasmScriptingVM::deliverAllHeldOutcomes()
 {
   t_holdingVMs->deliver([](WasmScriptingVM* vm) { vm->deliverHeldOutcomes(); });
+}
+
+bool WasmScriptingVM::hasPendingAsyncWorkOnThread()
+{
+  {
+    VMPollList::Lock lock(*t_holdingVMs);
+    if (!t_holdingVMs->vms.empty())
+    {
+      return true;
+    }
+  }
+  VMPollList::Lock lock(*t_laneVMs);
+  for (WasmScriptingVM* vm : t_laneVMs->vms)
+  {
+    if (vm->hasPendingAsyncWork())
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 void WasmScriptingVM::setBootHook(BootHook hook)
@@ -13483,6 +13956,7 @@ bool WasmScriptingVM::bootModule()
   // rewinding or finalizing.
   m_frameMinor = hasExport("__riveFrameMinor");
   m_frameRelease = m_frameMinor && hasExport("__riveFrameRelease");
+  m_frameTrim = m_frameMinor && hasExport("__riveFrameTrim");
   m_frameMajorsProbe = hasExport("__riveFrameMajors");
   // Stub modules report their bump position, finer than page counts.
   m_heapUsedProbe = hasExport("__riveHeapUsed");
@@ -13500,6 +13974,13 @@ bool WasmScriptingVM::bootModule()
   {
     m_lastError = "host_newstate failed";
     return false;
+  }
+  // The blob calls only what it was told the host has, so one built for a
+  // newer host still runs on an older one.
+  if (hasExport("host_features"))
+  {
+    uint32_t featureArgs[1] = {kHostFeatures};
+    callModule("host_features", 1, featureArgs);
   }
   // A deterministic run pins math.random, as ScriptingVM::init does for
   // native Luau. Older blobs without the export stay clock-seeded.
@@ -13579,6 +14060,10 @@ void WasmScriptingVM::joinFrameReport(
   joined += report;
 }
 
+// Boundaries between trims, and how long a free chunk sits idle before one
+// releases it.
+static constexpr uint32_t kTrimBoundaries = 64;
+
 const char* WasmScriptingVM::collectFrame()
 {
   if (!valid())
@@ -13609,6 +14094,14 @@ const char* WasmScriptingVM::collectFrame()
       // runs after the collection, never inside it. (A host that
       // skips it gets them released at the next boundary.)
       callModule("__riveFrameRelease", 0, nullptr);
+    }
+    // A spike's memory goes back to the system while the file stays open,
+    // once its chunks sat free for a whole window.
+    if (m_frameTrim && ++m_boundariesSinceTrim == kTrimBoundaries)
+    {
+      m_boundariesSinceTrim = 0;
+      uint32_t args[1] = {kTrimBoundaries};
+      callModule("__riveFrameTrim", 1, args);
     }
     if (!m_frameMinorAnnounced)
     {
@@ -13836,6 +14329,31 @@ bool WasmScriptingVM::memoryLimits(uint32_t* pages, uint32_t* maxPages) const
   return true;
 }
 #endif
+
+void WasmScriptingVM::releasePages(uint32_t start, uint32_t length)
+{
+#ifndef __EMSCRIPTEN__
+  if (m_state == nullptr || m_state->instance == nullptr)
+  {
+    return;
+  }
+  wasm_memory_inst_t memory = wasm_runtime_get_default_memory(
+      m_state->instance);
+  // Another thread may be using a shared memory's pages.
+  if (memory == nullptr || wasm_memory_get_shared(memory))
+  {
+    return;
+  }
+  uint64_t size = wasm_memory_get_cur_page_count(memory) *
+                  wasm_memory_get_bytes_per_page(memory);
+  if ((uint64_t)start + length > size)
+  {
+    return;
+  }
+  auto* base = (uint8_t*)wasm_memory_get_base_address(memory);
+  releaseSystemPages(base + start, base + start + length);
+#endif
+}
 
 uint32_t WasmScriptingVM::memoryPages() const
 {
@@ -14284,6 +14802,61 @@ bool WasmScriptingVM::callPathEffectUpdate(
   {
     return false;
   }
+  // _v2 also gets a node over the shape, the Luau lane's NodeData; modules
+  // built before it get the paint alone.
+  size_t scopeStart = m_scopedNodes.size();
+  uint32_t node = m_pathEffectV2 && shape != nullptr
+                      ? mintNode(this, nullptr, shape)
+                      : 0;
+  bool ok = callPathEffectWithNode(
+      object,
+      selfRef,
+      sourcePath,
+      paint,
+      node,
+      outPath);
+  releaseScopedNodes(scopeStart);
+  return ok;
+}
+
+#ifdef WITH_RIVE_TOOLS
+bool WasmScriptingVM::callPathEffectUpdate(
+    ScriptedObject* object,
+    int selfRef,
+    const RawPath& sourcePath,
+    const PathEffectPaintWire& paint,
+    WasmNodeSource* source,
+    uint32_t shape,
+    RawPath* outPath)
+{
+  if (!valid() || outPath == nullptr)
+  {
+    return false;
+  }
+  size_t scopeStart = m_scopedNodes.size();
+  uint32_t node = m_pathEffectV2 && source != nullptr && shape != 0
+                      ? mintSourceNode(this, source, shape)
+                      : 0;
+  bool ok = callPathEffectWithNode(
+      object,
+      selfRef,
+      sourcePath,
+      paint,
+      node,
+      outPath);
+  releaseScopedNodes(scopeStart);
+  return ok;
+}
+#endif
+
+bool WasmScriptingVM::callPathEffectWithNode(
+    ScriptedObject* object,
+    int selfRef,
+    const RawPath& sourcePath,
+    const PathEffectPaintWire& paint,
+    uint32_t node,
+    RawPath* outPath)
+{
   uint32_t verbCount = (uint32_t)sourcePath.verbs().size();
   uint32_t floatCount = (uint32_t)sourcePath.points().size() * 2;
   uint32_t pointBytes = floatCount * (uint32_t)sizeof(float);
@@ -14303,15 +14876,6 @@ bool WasmScriptingVM::callPathEffectUpdate(
       sourcePath.verbs().data(),
       verbCount);
   m_pathEffectOut = outPath;
-  // _v2 also gets a node over the shape, the Luau lane's NodeData; modules
-  // built before it get the paint alone.
-  bool withNode = m_pathEffectV2;
-  size_t scopeStart = m_scopedNodes.size();
-  uint32_t nodeHandle = 0;
-  if (withNode && shape != nullptr)
-  {
-    nodeHandle = mintNode(this, nullptr, shape);
-  }
   uint32_t args[8] = {
       m_L,
       (uint32_t)selfRef,
@@ -14320,10 +14884,9 @@ bool WasmScriptingVM::callPathEffectUpdate(
       dataPtr + (uint32_t)sizeof(paint),
       floatCount,
       dataPtr,
-      nodeHandle};
-  uint32_t ok = withNode ? callModule("host_obj_path_effect_v2", 8, args)
-                         : callModule("host_obj_path_effect", 7, args);
-  releaseScopedNodes(scopeStart);
+      node};
+  uint32_t ok = m_pathEffectV2 ? callModule("host_obj_path_effect_v2", 8, args)
+                               : callModule("host_obj_path_effect", 7, args);
   m_pathEffectOut = nullptr;
   guestFree(dataPtr);
   return ok != 0;

@@ -397,10 +397,10 @@ def emit_host():
     lines.append('')
     # The browser lane shares the cores above and has no WAMR to adapt to.
     lines += [
-        '#ifndef __EMSCRIPTEN__',
-        '// What rt.features answers.',
+        '// What rt.features answers, and what a booting module is told.',
         'constexpr uint32_t kHostFeatures = 0x%xu;' % HOST_FEATURES,
         '',
+        '#ifndef __EMSCRIPTEN__',
     ]
     for namespace in NAMESPACES:
         for op in namespace['ops']:
@@ -656,6 +656,7 @@ AS_OWNING_FACTORIES = {
     ('buffer', 'new'),
     ('mesh_instances', 'new'),
     ('image', 'from_asset'),
+    ('image', 'load'),
     ('shader', 'linear'),
     ('shader', 'radial'),
     ('measure', 'path_new'),
@@ -1023,6 +1024,8 @@ def emit_web_imports():
         '                stageManaged(message, (text_p, length) =>',
         '                    calls.rive_trace(text_p, length, n, a0, a1, a2, a3, a4)',
         '                ),',
+        "            // A browser's console shows no call site.",
+        "            'console.caller': () => {},",
         "            'console.log': consoleCall(0),",
         "            'console.debug': consoleCall(0),",
         "            'console.info': consoleCall(0),",

@@ -1328,8 +1328,17 @@ public:
       case TextInputBase::textPropertyKey:
         object->as<TextInputBase>()->text(value);
         break;
+      case TextInputBase::languagePropertyKey:
+        object->as<TextInputBase>()->language(value);
+        break;
+      case TextBase::languagePropertyKey:
+        object->as<TextBase>()->language(value);
+        break;
       case TextValueRunBase::textPropertyKey:
         object->as<TextValueRunBase>()->text(value);
+        break;
+      case TextValueRunBase::languagePropertyKey:
+        object->as<TextValueRunBase>()->language(value);
         break;
       case FileAssetBase::cdnBaseUrlPropertyKey:
         object->as<FileAssetBase>()->cdnBaseUrl(value);
@@ -1614,6 +1623,9 @@ public:
         break;
       case StateMachineListenerBase::phaseValuePropertyKey:
         object->as<StateMachineListenerBase>()->phaseValue(value);
+        break;
+      case StateMachineListenerBase::listenerFlagsPropertyKey:
+        object->as<StateMachineListenerBase>()->listenerFlags(value);
         break;
       case StateMachineListenerSingleBase::listenerTypeValuePropertyKey:
         object->as<StateMachineListenerSingleBase>()->listenerTypeValue(value);
@@ -1905,6 +1917,9 @@ public:
       case TextInputBase::maxLinesPropertyKey:
         object->as<TextInputBase>()->maxLines(value);
         break;
+      case TextInputBase::languageIdPropertyKey:
+        object->as<TextInputBase>()->languageId(value);
+        break;
       case TextStyleAxisBase::tagPropertyKey:
         object->as<TextStyleAxisBase>()->tag(value);
         break;
@@ -1937,6 +1952,12 @@ public:
         break;
       case TextBase::verticalTrimBottomValuePropertyKey:
         object->as<TextBase>()->verticalTrimBottomValue(value);
+        break;
+      case TextBase::languageIdPropertyKey:
+        object->as<TextBase>()->languageId(value);
+        break;
+      case TextValueRunBase::languageIdPropertyKey:
+        object->as<TextValueRunBase>()->languageId(value);
         break;
       case FileAssetBase::assetIdPropertyKey:
         object->as<FileAssetBase>()->assetId(value);
@@ -3566,8 +3587,14 @@ public:
         return object->as<BindablePropertyStringBase>()->propertyValue();
       case TextInputBase::textPropertyKey:
         return object->as<TextInputBase>()->text();
+      case TextInputBase::languagePropertyKey:
+        return object->as<TextInputBase>()->language();
+      case TextBase::languagePropertyKey:
+        return object->as<TextBase>()->language();
       case TextValueRunBase::textPropertyKey:
         return object->as<TextValueRunBase>()->text();
+      case TextValueRunBase::languagePropertyKey:
+        return object->as<TextValueRunBase>()->language();
       case FileAssetBase::cdnBaseUrlPropertyKey:
         return object->as<FileAssetBase>()->cdnBaseUrl();
       case TextAssetBase::folderPathPropertyKey:
@@ -3771,6 +3798,8 @@ public:
         return object->as<BlendAnimationDirectBase>()->blendSource();
       case StateMachineListenerBase::phaseValuePropertyKey:
         return object->as<StateMachineListenerBase>()->phaseValue();
+      case StateMachineListenerBase::listenerFlagsPropertyKey:
+        return object->as<StateMachineListenerBase>()->listenerFlags();
       case StateMachineListenerSingleBase::listenerTypeValuePropertyKey:
         return object->as<StateMachineListenerSingleBase>()
             ->listenerTypeValue();
@@ -3969,6 +3998,8 @@ public:
         return object->as<TextInputBase>()->maxCharacters();
       case TextInputBase::maxLinesPropertyKey:
         return object->as<TextInputBase>()->maxLines();
+      case TextInputBase::languageIdPropertyKey:
+        return object->as<TextInputBase>()->languageId();
       case TextStyleAxisBase::tagPropertyKey:
         return object->as<TextStyleAxisBase>()->tag();
       case TextBase::alignValuePropertyKey:
@@ -3991,6 +4022,10 @@ public:
         return object->as<TextBase>()->verticalTrimTopValue();
       case TextBase::verticalTrimBottomValuePropertyKey:
         return object->as<TextBase>()->verticalTrimBottomValue();
+      case TextBase::languageIdPropertyKey:
+        return object->as<TextBase>()->languageId();
+      case TextValueRunBase::languageIdPropertyKey:
+        return object->as<TextValueRunBase>()->languageId();
       case FileAssetBase::assetIdPropertyKey:
         return object->as<FileAssetBase>()->assetId();
       case ScriptAssetBase::generatorFunctionRefPropertyKey:
@@ -5040,7 +5075,10 @@ public:
       case DataConverterToStringBase::colorFormatPropertyKey:
       case BindablePropertyStringBase::propertyValuePropertyKey:
       case TextInputBase::textPropertyKey:
+      case TextInputBase::languagePropertyKey:
+      case TextBase::languagePropertyKey:
       case TextValueRunBase::textPropertyKey:
+      case TextValueRunBase::languagePropertyKey:
       case FileAssetBase::cdnBaseUrlPropertyKey:
       case TextAssetBase::folderPathPropertyKey:
         return CoreStringType::id;
@@ -5135,6 +5173,7 @@ public:
       case KeyFrameUintBase::valuePropertyKey:
       case BlendAnimationDirectBase::blendSourcePropertyKey:
       case StateMachineListenerBase::phaseValuePropertyKey:
+      case StateMachineListenerBase::listenerFlagsPropertyKey:
       case StateMachineListenerSingleBase::listenerTypeValuePropertyKey:
       case KeyedPropertyBase::propertyKeyPropertyKey:
       case TransitionPropertyArtboardComparatorBase::propertyTypePropertyKey:
@@ -5224,6 +5263,7 @@ public:
       case TextInputBase::verticalAlignValuePropertyKey:
       case TextInputBase::maxCharactersPropertyKey:
       case TextInputBase::maxLinesPropertyKey:
+      case TextInputBase::languageIdPropertyKey:
       case TextStyleAxisBase::tagPropertyKey:
       case TextBase::alignValuePropertyKey:
       case TextBase::sizingValuePropertyKey:
@@ -5235,6 +5275,8 @@ public:
       case TextBase::verticalTrimValuePropertyKey:
       case TextBase::verticalTrimTopValuePropertyKey:
       case TextBase::verticalTrimBottomValuePropertyKey:
+      case TextBase::languageIdPropertyKey:
+      case TextValueRunBase::languageIdPropertyKey:
       case FileAssetBase::assetIdPropertyKey:
       case ScriptAssetBase::generatorFunctionRefPropertyKey:
       case ScriptAssetBase::serializedImplementedMethodsPropertyKey:
@@ -5888,7 +5930,13 @@ public:
         return BindablePropertyStringBase::typeKey;
       case TextInputBase::textPropertyKey:
         return TextInputBase::typeKey;
+      case TextInputBase::languagePropertyKey:
+        return TextInputBase::typeKey;
+      case TextBase::languagePropertyKey:
+        return TextBase::typeKey;
       case TextValueRunBase::textPropertyKey:
+        return TextValueRunBase::typeKey;
+      case TextValueRunBase::languagePropertyKey:
         return TextValueRunBase::typeKey;
       case FileAssetBase::cdnBaseUrlPropertyKey:
         return FileAssetBase::typeKey;
@@ -6073,6 +6121,8 @@ public:
         return BlendAnimationDirectBase::typeKey;
       case StateMachineListenerBase::phaseValuePropertyKey:
         return StateMachineListenerBase::typeKey;
+      case StateMachineListenerBase::listenerFlagsPropertyKey:
+        return StateMachineListenerBase::typeKey;
       case StateMachineListenerSingleBase::listenerTypeValuePropertyKey:
         return StateMachineListenerSingleBase::typeKey;
       case KeyedPropertyBase::propertyKeyPropertyKey:
@@ -6243,6 +6293,8 @@ public:
         return TextInputBase::typeKey;
       case TextInputBase::maxLinesPropertyKey:
         return TextInputBase::typeKey;
+      case TextInputBase::languageIdPropertyKey:
+        return TextInputBase::typeKey;
       case TextStyleAxisBase::tagPropertyKey:
         return TextStyleAxisBase::typeKey;
       case TextBase::alignValuePropertyKey:
@@ -6265,6 +6317,10 @@ public:
         return TextBase::typeKey;
       case TextBase::verticalTrimBottomValuePropertyKey:
         return TextBase::typeKey;
+      case TextBase::languageIdPropertyKey:
+        return TextBase::typeKey;
+      case TextValueRunBase::languageIdPropertyKey:
+        return TextValueRunBase::typeKey;
       case FileAssetBase::assetIdPropertyKey:
         return FileAssetBase::typeKey;
       case ScriptAssetBase::generatorFunctionRefPropertyKey:

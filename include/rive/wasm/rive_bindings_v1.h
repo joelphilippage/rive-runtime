@@ -16,10 +16,11 @@
 // one contract and run against another links its imports to
 // nothing, so a build that carries this can be told apart from one
 // that predates a change to it.
-#define RIVE_BINDINGS_V1_CONTRACT "5e80f7bbbb0cd2db"
+#define RIVE_BINDINGS_V1_CONTRACT "9aa6f0e244e2ba71"
 
 // The bits rive_rt_features answers.
 #define RIVE_HOST_FEATURE_PARALLEL_CALLS (1u << 0)
+#define RIVE_HOST_FEATURE_IDENTITY (1u << 1)
 
 #define RIVE_BINDING_IMPORT(module, name)                            \
     __attribute__((import_module(module), import_name(name)))
@@ -242,6 +243,8 @@ RIVE_BINDING_IMPORT("rive_rt_v1", "zone_name")
 uint32_t rive_rt_zone_name(double epochSeconds, char* buffer, uint32_t capacity);
 RIVE_BINDING_IMPORT("rive_rt_v1", "arg")
 uint32_t rive_rt_arg(const char* name, uint32_t nameLength, char* buffer, uint32_t capacity);
+RIVE_BINDING_IMPORT("rive_rt_v1", "release_pages")
+void rive_rt_release_pages(uint32_t start, uint32_t length);
 
 // rive_data_v1
 RIVE_BINDING_IMPORT("rive_data_v1", "view_model")
@@ -260,6 +263,10 @@ RIVE_BINDING_IMPORT("rive_data_v1", "context_view_model")
 uint32_t rive_data_context_view_model(uint32_t dataContext);
 RIVE_BINDING_IMPORT("rive_data_v1", "context_release")
 void rive_data_context_release(uint32_t dataContext);
+RIVE_BINDING_IMPORT("rive_data_v1", "context_equal")
+uint32_t rive_data_context_equal(uint32_t a, uint32_t b);
+RIVE_BINDING_IMPORT("rive_data_v1", "context_identity")
+uint32_t rive_data_context_identity(uint32_t dataContext);
 RIVE_BINDING_IMPORT("rive_data_v1", "has_view_model")
 uint32_t rive_data_has_view_model(const char* name, uint32_t nameLength);
 RIVE_BINDING_IMPORT("rive_data_v1", "new_view_model")
@@ -286,6 +293,8 @@ RIVE_BINDING_IMPORT("rive_data_v1", "vmi_symbol_index")
 uint32_t rive_data_vmi_symbol_index(uint32_t vmi);
 RIVE_BINDING_IMPORT("rive_data_v1", "vmi_equal")
 uint32_t rive_data_vmi_equal(uint32_t a, uint32_t b);
+RIVE_BINDING_IMPORT("rive_data_v1", "vmi_identity")
+uint32_t rive_data_vmi_identity(uint32_t vmi);
 RIVE_BINDING_IMPORT("rive_data_v1", "view_model_get")
 uint32_t rive_data_view_model_get(uint32_t property);
 RIVE_BINDING_IMPORT("rive_data_v1", "vmi_list")
@@ -314,12 +323,18 @@ RIVE_BINDING_IMPORT("rive_data_v1", "blob_present")
 uint32_t rive_data_blob_present(uint32_t property);
 RIVE_BINDING_IMPORT("rive_data_v1", "blob_get")
 uint32_t rive_data_blob_get(uint32_t property, uint8_t* buffer, uint32_t capacity);
+RIVE_BINDING_IMPORT("rive_data_v1", "blob_read")
+uint32_t rive_data_blob_read(uint32_t property, uint32_t offset, uint8_t* out, uint32_t outByteCount);
 RIVE_BINDING_IMPORT("rive_data_v1", "blob_name")
 uint32_t rive_data_blob_name(uint32_t property, char* buffer, uint32_t capacity);
 RIVE_BINDING_IMPORT("rive_data_v1", "blob_set")
 void rive_data_blob_set(uint32_t property, const uint8_t* bytes, uint32_t byteCount);
 RIVE_BINDING_IMPORT("rive_data_v1", "blob_clear")
 void rive_data_blob_clear(uint32_t property);
+RIVE_BINDING_IMPORT("rive_data_v1", "blob_seen")
+void rive_data_blob_seen(uint32_t property);
+RIVE_BINDING_IMPORT("rive_data_v1", "blob_changed")
+uint32_t rive_data_blob_changed(uint32_t property);
 RIVE_BINDING_IMPORT("rive_data_v1", "artboard_get")
 uint32_t rive_data_artboard_get(uint32_t property);
 RIVE_BINDING_IMPORT("rive_data_v1", "artboard_set")
@@ -332,6 +347,10 @@ RIVE_BINDING_IMPORT("rive_data_v1", "enum_values")
 uint32_t rive_data_enum_values(uint32_t property, char* buffer, uint32_t capacity);
 RIVE_BINDING_IMPORT("rive_data_v1", "prop_release")
 void rive_data_prop_release(uint32_t property);
+RIVE_BINDING_IMPORT("rive_data_v1", "prop_equal")
+uint32_t rive_data_prop_equal(uint32_t a, uint32_t b);
+RIVE_BINDING_IMPORT("rive_data_v1", "prop_identity")
+uint32_t rive_data_prop_identity(uint32_t property);
 RIVE_BINDING_IMPORT("rive_data_v1", "trigger_fire")
 void rive_data_trigger_fire(uint32_t property);
 RIVE_BINDING_IMPORT("rive_data_v1", "list_length")
@@ -414,6 +433,10 @@ RIVE_BINDING_IMPORT("rive_artboard_v1", "scroll_event")
 uint32_t rive_artboard_scroll_event(uint32_t artboard, uint32_t pointerId, float x, float y, float dx, float dy, uint32_t phase, uint32_t precise, float timeStamp);
 RIVE_BINDING_IMPORT("rive_artboard_v1", "gamepad_event")
 uint32_t rive_artboard_gamepad_event(uint32_t artboard, const uint8_t* payload, uint32_t byteCount);
+RIVE_BINDING_IMPORT("rive_artboard_v1", "keyboard_event")
+uint32_t rive_artboard_keyboard_event(uint32_t artboard, uint32_t key, uint32_t modifiers, uint32_t isPressed, uint32_t isRepeat);
+RIVE_BINDING_IMPORT("rive_artboard_v1", "text_event")
+uint32_t rive_artboard_text_event(uint32_t artboard, const char* text, uint32_t length);
 RIVE_BINDING_IMPORT("rive_artboard_v1", "animation")
 uint32_t rive_artboard_animation(uint32_t artboard, const char* name, uint32_t length);
 RIVE_BINDING_IMPORT("rive_artboard_v1", "animation_release")
@@ -746,6 +769,8 @@ void rive_mesh_instances_release(uint32_t instances);
 // rive_blob_v1
 RIVE_BINDING_IMPORT("rive_blob_v1", "asset_bytes")
 uint32_t rive_blob_asset_bytes(uint32_t object, const char* name, uint32_t nameLength, uint8_t* out, uint32_t outCount);
+RIVE_BINDING_IMPORT("rive_blob_v1", "asset_read")
+uint32_t rive_blob_asset_read(uint32_t object, const char* name, uint32_t nameLength, uint32_t offset, uint8_t* out, uint32_t outByteCount);
 
 // rive_image_v1
 RIVE_BINDING_IMPORT("rive_image_v1", "from_asset")
@@ -760,6 +785,8 @@ RIVE_BINDING_IMPORT("rive_image_v1", "decode")
 uint32_t rive_image_decode(const uint8_t* bytes, uint32_t byteCount, uint32_t token);
 RIVE_BINDING_IMPORT("rive_image_v1", "decode_cancel")
 void rive_image_decode_cancel(uint32_t token);
+RIVE_BINDING_IMPORT("rive_image_v1", "load")
+uint32_t rive_image_load(const uint8_t* bytes, uint32_t byteCount);
 
 // rive_font_v1
 RIVE_BINDING_IMPORT("rive_font_v1", "from_asset")
@@ -886,8 +913,12 @@ RIVE_BINDING_IMPORT("rive_file_v1", "bindable_name")
 uint32_t rive_file_bindable_name(uint32_t bindable, char* buffer, uint32_t capacity);
 RIVE_BINDING_IMPORT("rive_file_v1", "bindable_data")
 uint32_t rive_file_bindable_data(uint32_t bindable);
+RIVE_BINDING_IMPORT("rive_file_v1", "host_bindable")
+uint32_t rive_file_host_bindable(uint32_t object, const char* name, uint32_t nameLength, uint32_t useDefault);
 RIVE_BINDING_IMPORT("rive_file_v1", "bindable_equal")
 uint32_t rive_file_bindable_equal(uint32_t a, uint32_t b);
+RIVE_BINDING_IMPORT("rive_file_v1", "bindable_identity")
+uint32_t rive_file_bindable_identity(uint32_t bindable);
 
 // rive_lanes_v1
 RIVE_BINDING_IMPORT("rive_lanes_v1", "start")

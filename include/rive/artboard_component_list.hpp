@@ -91,6 +91,20 @@ public:
   }
   void updateWorldTransform() override;
   void updateList(std::vector<rcp<ViewModelInstanceListItem>>* list) override;
+  void boundListSource(const Core* source) override { m_listSource = source; }
+  const Core* hostedRowsSource() const override { return m_listSource; }
+
+  // How deep rows may nest while one is built: building a row binds it, and
+  // the lists inside it build their rows right then, on the same stack. A
+  // row that ends up hosting rows of itself would otherwise recurse until
+  // the stack overflows (RIVE_NATIVE-18W). Lower where files are authored,
+  // so a runaway nesting stops before it has built many rows.
+#ifdef WITH_RIVE_TOOLS
+  static constexpr uint32_t maxRowNesting = 16;
+#else
+  static constexpr uint32_t maxRowNesting = 64;
+#endif
+
   void draw(Renderer* renderer) override;
   bool willDraw() override;
   Core* hitTest(HitInfo*, const Mat2D&) override;
@@ -204,6 +218,10 @@ private:
   void poolListItem(const rcp<ViewModelInstanceListItem>& listItem);
   // Builds the row for the item at index, from the pool when one is there.
   void createOrReuseArtboardAt(int index);
+  // True when a row of source, built now, would nest in itself: past
+  // maxRowNesting, or inside a row of the same artboard that a list made
+  // from the same source as this one, whose rows would repeat it forever.
+  bool refusesNestedRow(const Artboard* source) const;
   // Destroys the pooled rows, state machines first.
   void releasePools();
   // Takes every row out of the list into the pools, as an update to no items
@@ -223,6 +241,11 @@ private:
       ArtboardInstance* artboard);
   void computeLayoutBounds();
   bool isWithinVisibleWindow(int index) const;
+  bool viewportCullsBufferedRows(
+      Renderer* renderer,
+      const Mat2D& listTransform,
+      Mat2D* listToDevice,
+      AABB* deviceViewport);
   void createArtboardRecorders(const Artboard*);
   void applyRecorders(Artboard* artboard, const Artboard* sourceArtboard);
   void applyRecorders(
@@ -362,6 +385,19 @@ private:
   bool tryQuietRow(size_t row);
   // Quiets every row while none are realized; realizing a row wakes it.
   void quietUnrealizedRows();
+  // Wakes every quiet row, for a change none of them can see coming.
+  void wakeQuietRows();
+  // TextLanguages::generation() the rows last advanced under: text in a
+  // quiet row inherits the system languages too, so a change wakes them.
+  uint32_t m_languageGeneration = 0;
+#ifdef WITH_RIVE_TEXT
+  // Font::fallbackFontsGeneration() the rows last advanced under, for the
+  // same reason: text in a quiet row reshapes for new fallback fonts too.
+  uint32_t m_fallbackFontsGeneration = 0;
+#endif
+  // Whether the system languages or fallback fonts changed since the rows
+  // last advanced.
+  bool textEnvironmentChanged() const;
   // Whether the row's work would do nothing right now.
   AdvancingComponent::QuietState rowQuietState(size_t row);
   // Wakes the row and forgets it can't be quiet: its instances are about to
@@ -393,6 +429,10 @@ public:
   static uint32_t sm_rowScans;
   // Lets a test run the same frames with and without quiet rows.
   static bool sm_quietRowsEnabled;
+  // Whether a row that its machine's advance leaves quiet goes quiet then,
+  // skipping its artboard's advance, instead of at the next frame's start.
+  // On by default.
+  static bool sm_requietAfterMachine;
   // Lets a benchmark time quiet rows without checking each one every pass.
   static bool sm_verifyQuietRows;
   // Lets a test run the same frames with and without handing rows that host
@@ -426,6 +466,12 @@ private:
   bool m_advancesNested = true;
   // Set while restartRows runs: the rows it pools stay for the next update.
   bool m_keepPools = false;
+  // Whether the rows were told the list is fully transparent, through their
+  // host opacity. Any other opacity applies when the list draws them.
+  bool m_rowsHidden = false;
+  // What the bound list comes from (see boundListSource); null when unbound
+  // or when a converter makes the list.
+  const Core* m_listSource = nullptr;
   /// Always paint / scroll order (ascending drawIndex when enabled).
   std::vector<int> m_cachedOrderedListIndices;
   std::unordered_map<

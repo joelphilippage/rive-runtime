@@ -56,6 +56,7 @@ public:
     if (!m_state || m_promiseRef == LUA_NOREF)
       return;
     lua_State* L = m_state;
+    bool settled = false;
     lua_rawgeti(L, LUA_REGISTRYINDEX, m_promiseRef);
     auto* promise = lua_torive<ScriptedPromise>(L, -1, true);
     lua_pop(L, 1);
@@ -72,6 +73,7 @@ public:
         m_bitmap.reset();
         lua_unref(L, m_promiseRef);
         m_promiseRef = LUA_NOREF;
+        ScriptingContext::asyncWorkDelivered(L);
         return;
       }
       lua_newtable(L);
@@ -85,6 +87,7 @@ public:
       lua_setfield(L, -2, "height");
       promise->resolve(L, lua_gettop(L));
       lua_pop(L, 1);
+      settled = true;
     }
     // Release decoded bitmap immediately — the pixels have been
     // copied to the Lua buffer. The TaskRef userdata in the onCancel
@@ -95,6 +98,10 @@ public:
     m_encodedData.shrink_to_fit();
     lua_unref(L, m_promiseRef);
     m_promiseRef = LUA_NOREF;
+    if (settled)
+    {
+      ScriptingContext::asyncWorkDelivered(L);
+    }
   }
 
   void onError(const std::string& error) override
@@ -105,7 +112,8 @@ public:
     lua_rawgeti(L, LUA_REGISTRYINDEX, m_promiseRef);
     auto* promise = lua_torive<ScriptedPromise>(L, -1, true);
     lua_pop(L, 1);
-    if (promise && promise->isPending())
+    bool settled = promise && promise->isPending();
+    if (settled)
     {
       lua_pushstring(L, error.c_str());
       promise->reject(L, lua_gettop(L));
@@ -113,6 +121,10 @@ public:
     }
     lua_unref(L, m_promiseRef);
     m_promiseRef = LUA_NOREF;
+    if (settled)
+    {
+      ScriptingContext::asyncWorkDelivered(L);
+    }
   }
 
   void onCancel() override
@@ -247,6 +259,7 @@ void settleDecode(
   }
   auto [L, promiseRef] = it->second;
   s_pendingDecodes.erase(it);
+  bool settled = false;
 
   lua_rawgeti(L, LUA_REGISTRYINDEX, promiseRef);
   auto* promise = lua_torive<ScriptedPromise>(L, -1, true);
@@ -276,8 +289,15 @@ void settleDecode(
       promise->resolve(L, lua_gettop(L));
     }
     lua_pop(L, 1);
+    settled = true;
   }
   lua_unref(L, promiseRef);
+  // Settled from a browser callback, between frames: the continuation's
+  // changes wait for an advance only a wake asks for.
+  if (settled)
+  {
+    ScriptingContext::asyncWorkDelivered(L);
+  }
 }
 
 } // namespace
@@ -378,5 +398,61 @@ int context_decodeImage_impl(lua_State* L)
 }
 
 #endif // __EMSCRIPTEN__
+
+// ============================================================================
+// loadImage — encoded bytes straight to a drawable Image
+// ============================================================================
+
+// Decodes through the factory the file was imported with, the one its image
+// assets decode through, so the Image draws wherever an asset's would and can
+// be assigned to a view model image property. The promise settles before this
+// returns; returning one keeps the signature free to move the work off the
+// thread later. Native factories decode here and return null on bad bytes.
+// The web and Flutter factories and the deferred one hand back an image that
+// decodes later, as they do for assets: it resolves while its size still
+// reads 0, and bytes that never decode leave it blank. None of them reports
+// when that decode finishes or fails, so there is nothing to wait on.
+int context_loadImage_impl(lua_State* L)
+{
+  using namespace rive;
+
+  size_t len = 0;
+  const void* data = nullptr;
+  if (lua_isbuffer(L, 2))
+    data = lua_tobuffer(L, 2, &len);
+  else
+  {
+    luaL_typeerror(L, 2, "buffer");
+    return 0;
+  }
+  if (!data || len == 0)
+  {
+    luaL_error(L, "loadImage: empty buffer");
+    return 0;
+  }
+
+  auto* ctx = static_cast<ScriptingContext*>(lua_getthreaddata(L));
+  Factory* factory = ctx != nullptr ? ctx->factory() : nullptr;
+  rcp<RenderImage> image;
+  if (factory != nullptr)
+  {
+    image = factory->decodeImage(
+        Span<const uint8_t>(static_cast<const uint8_t*>(data), len));
+  }
+
+  auto* promise = lua_newrive<ScriptedPromise>(L, lua_mainthread(L));
+  if (image == nullptr)
+  {
+    lua_pushstring(L, "failed to decode image data");
+    promise->reject(L, lua_gettop(L));
+  }
+  else
+  {
+    ScriptedImage::luaNew(L)->image = std::move(image);
+    promise->resolve(L, lua_gettop(L));
+  }
+  lua_pop(L, 1);
+  return 1;
+}
 
 #endif // WITH_RIVE_SCRIPTING

@@ -1,5 +1,7 @@
 #include "rive/component.hpp"
 #include "rive/file.hpp"
+#include "rive/text/text_language.hpp"
+#include "rive/text_engine.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -38,6 +40,44 @@
 #include "rive/semantic/semantic_data.hpp"
 
 using namespace rive;
+
+namespace
+{
+// A row being built on this thread. Building a row binds it, and the lists
+// inside it build their rows during that bind, so the rows still being built
+// are exactly the ones on the stack: each links to the one it is built in.
+// A row's host is set only once its bind returns, so this chain is the only
+// record of where they nest. They live in the frames that build them, so
+// tracking them allocates nothing.
+struct RowBuild
+{
+  const Artboard* source;
+  const Core* listSource;
+  // The list building the row.
+  const ArtboardComponentList* list;
+  const RowBuild* outer;
+};
+thread_local const RowBuild* s_rowBuild = nullptr;
+
+class RowBuildScope
+{
+public:
+  RowBuildScope(
+      const Artboard* source,
+      const Core* listSource,
+      const ArtboardComponentList* list)
+      : m_build{source, listSource, list, s_rowBuild}
+  {
+    s_rowBuild = &m_build;
+  }
+  ~RowBuildScope() { s_rowBuild = m_build.outer; }
+  RowBuildScope(const RowBuildScope&) = delete;
+  RowBuildScope& operator=(const RowBuildScope&) = delete;
+
+private:
+  RowBuild m_build;
+};
+} // namespace
 
 namespace rive
 {
@@ -1103,8 +1143,11 @@ void ArtboardComponentList::updateList(
         m_stateMachinesByIndex[index] = smItr->second.get();
       }
     }
-    else if (!virtualized)
+    else if (!virtualized && !refusesNestedRow(artboard))
     {
+      // What the row builds while it binds, and while its state machine
+      // enters its first state, nests in it.
+      RowBuildScope build(artboard, m_listSource, this);
       createOrReuseArtboardAt(index);
       // Enter the new row's initial state now, the way the settle pass would
       // a step later, so the first layout solve and text shape already see
@@ -1160,11 +1203,76 @@ void ArtboardComponentList::syncLayoutChildren()
 #ifdef TESTING
 uint64_t ArtboardComponentList::sm_quietRowSkips = 0;
 bool ArtboardComponentList::sm_quietRowsEnabled = true;
+bool ArtboardComponentList::sm_requietAfterMachine = true;
 bool ArtboardComponentList::sm_verifyQuietRows = true;
 bool ArtboardComponentList::sm_reuseHostingRows = true;
 uint64_t ArtboardComponentList::sm_reusedHostingRows = 0;
 bool ArtboardComponentList::sm_verifyingQuietRow = false;
 #endif
+
+// Whether a row that its machine's advance leaves quiet goes quiet then (see
+// advanceComponent). Tests can turn it off.
+static bool requietAfterMachine()
+{
+#ifdef TESTING
+  return ArtboardComponentList::sm_requietAfterMachine;
+#else
+  return true;
+#endif
+}
+
+bool ArtboardComponentList::refusesNestedRow(const Artboard* source) const
+{
+  if (source == nullptr)
+  {
+    return false;
+  }
+  // A row of the same artboard, made from the same source, around this one:
+  // say a row whose own list is bound to the list that made it, found through
+  // the parent context. This row would hold the same rows that one does, this
+  // one among them, without end. Rows of an artboard nested in its own rows
+  // from other sources -- a tree, each row listing its children -- are left to
+  // the depth cap: their data can end. So are lists a converter makes, which
+  // report no source (see boundListSource).
+  auto repeats = [&](const Artboard* aroundSource,
+                     const Core* aroundListSource) {
+    return m_listSource != nullptr && aroundSource == source &&
+           aroundListSource == m_listSource;
+  };
+  uint32_t depth = 0;
+  bool refuses = false;
+  // First the rows around this one still being built, innermost first...
+  const ArtboardComponentList* outermost = this;
+  for (const RowBuild* build = s_rowBuild; build != nullptr && !refuses;
+       build = build->outer)
+  {
+    refuses = repeats(build->source, build->listSource) ||
+              ++depth >= maxRowNesting;
+    outermost = build->list;
+  }
+  // ...then the hosted artboards the outermost of them is in, up to the root.
+  // A row a virtualized list realizes on a later pass, or that a later data
+  // change builds, is built outside any other row's build, and nests in those
+  // alone. Only list rows count: the walk goes through nested artboards, but
+  // one can't nest itself, so it can't make a loop on its own.
+  for (const Artboard* around = outermost->artboard();
+       !refuses && around != nullptr && around->host() != nullptr;
+       around = around->host()->parentArtboard())
+  {
+    const ArtboardHost* host = around->host();
+    if (host->type() != ArtboardComponentListBase::typeKey)
+    {
+      continue;
+    }
+    refuses = repeats(around->artboardSource(), host->hostedRowsSource()) ||
+              ++depth >= maxRowNesting;
+  }
+  if (refuses && m_file != nullptr)
+  {
+    m_file->noteRefusedNestedListRow();
+  }
+  return refuses;
+}
 
 static size_t lowestSetBit(uint64_t bits)
 {
@@ -1259,6 +1367,14 @@ AdvancingComponent::QuietState ArtboardComponentList::quietState()
   {
     return QuietState::quiet;
   }
+  // New system languages or fallback fonts: the next advance wakes the rows,
+  // whose text shapes with them (see advanceComponent). Collapsed, that
+  // waits until the list shows, and whatever shows it wakes the row hosting
+  // it.
+  if (!isCollapsed() && textEnvironmentChanged())
+  {
+    return QuietState::busy;
+  }
   // Collapsed, the advance only notes where the change sequence stands, for
   // the rows' machines once they run again. That too is nothing while every
   // row is quiet: a change one of them reads wakes it, and so this list's
@@ -1270,6 +1386,21 @@ AdvancingComponent::QuietState ArtboardComponentList::quietState()
 bool ArtboardComponentList::allRowsQuiet() const
 {
   return nextAwakeRow(0) >= m_listItems.size();
+}
+
+bool ArtboardComponentList::textEnvironmentChanged() const
+{
+  if (TextLanguages::generation() != m_languageGeneration)
+  {
+    return true;
+  }
+#ifdef WITH_RIVE_TEXT
+  if (Font::fallbackFontsGeneration() != m_fallbackFontsGeneration)
+  {
+    return true;
+  }
+#endif
+  return false;
 }
 
 bool ArtboardComponentList::canQuietRows() const
@@ -1295,6 +1426,23 @@ void ArtboardComponentList::quietUnrealizedRows()
   if (size_t tail = m_listItems.size() & 63)
   {
     m_quietRows.back() = (uint64_t(1) << tail) - 1;
+  }
+}
+
+void ArtboardComponentList::wakeQuietRows()
+{
+  for (size_t word = 0; word < m_quietRows.size(); word++)
+  {
+    for (uint64_t quiet = m_quietRows[word]; quiet != 0; quiet &= quiet - 1)
+    {
+      const size_t row = (word << 6) + lowestSetBit(quiet);
+      if (row < m_artboardInstancesByIndex.size() &&
+          m_artboardInstancesByIndex[row] != nullptr)
+      {
+        m_artboardInstancesByIndex[row]->quietHostRow(Artboard::kNoQuietRow);
+      }
+    }
+    m_quietRows[word] = 0;
   }
 }
 
@@ -1499,6 +1647,15 @@ bool ArtboardComponentList::advanceComponent(
                        AdvanceFlags::AdvanceNested;
   bool newFrame = (flags & AdvanceFlags::NewFrame) == AdvanceFlags::NewFrame;
   auto advancingFlags = flags & ~AdvanceFlags::IsRoot;
+  // New system languages and fallback fonts reshape text, in quiet rows too.
+  if (textEnvironmentChanged())
+  {
+    m_languageGeneration = TextLanguages::generation();
+#ifdef WITH_RIVE_TEXT
+    m_fallbackFontsGeneration = Font::fallbackFontsGeneration();
+#endif
+    wakeQuietRows();
+  }
   const size_t count = m_listItems.size();
   for (size_t row = nextAwakeRow(0); row < count; row = nextAwakeRow(row + 1))
   {
@@ -1534,6 +1691,13 @@ bool ArtboardComponentList::advanceComponent(
           if (stateMachine->advance(elapsedSeconds, newFrame))
           {
             keepGoing = true;
+          }
+          // A row woken only for its machine to search again, which found
+          // nothing to change, would go quiet at the next frame's start,
+          // before its artboard does any more work. It goes quiet now.
+          else if (requietAfterMachine() && tryQuietRow(row))
+          {
+            continue;
           }
         }
       }
@@ -1814,16 +1978,101 @@ const std::vector<int>& ArtboardComponentList::orderedListIndices()
   return m_cachedOrderedListIndices;
 }
 
+// A buffered row is realized just outside the scroll viewport, so it is
+// mounted and advancing before it scrolls in. While the viewport's clip is on
+// the renderer, a row that clips its own content can't show there, so drawing
+// it is wasted. Only the clip on the renderer counts: a draw rule can draw the
+// list outside its viewport's. Rows are measured in device space, which needs
+// a renderer that reports its transform; without one every row draws. So does
+// every row of a visited draw: the visitor can transform the list after the
+// viewport clipped, and the renderer's transform then no longer places the
+// clip. And so does every row a layer mask draws into its canvas: the
+// viewport's clip may be on the frame's renderer instead, and the canvas is
+// reused until the masked range changes, which the viewport isn't part of.
+bool ArtboardComponentList::viewportCullsBufferedRows(
+    Renderer* renderer,
+    const Mat2D& listTransform,
+    Mat2D* listToDevice,
+    AABB* deviceViewport)
+{
+  if (artboard()->hasDrawVisitor() || artboard()->drawsMaskedRange())
+  {
+    return false;
+  }
+  auto scroll = scrollConstraint();
+  if (scroll == nullptr || !scroll->hasLayoutParent())
+  {
+    return false;
+  }
+  auto viewport = scroll->content()->parent();
+  if (viewport == nullptr || !viewport->is<LayoutComponent>() ||
+      !viewport->as<LayoutComponent>()->clipsDrawing())
+  {
+    return false;
+  }
+  Mat2D toDevice;
+  if (!renderer->currentTransform(&toDevice))
+  {
+    return false;
+  }
+  auto layout = viewport->as<LayoutComponent>();
+  *listToDevice = toDevice * listTransform;
+  *deviceViewport = (toDevice * layout->worldTransform())
+                        .mapBoundingBox(layout->localBounds());
+  return true;
+}
+
+// Whether a row clipped to its bounds stays clear of the viewport by more than
+// antialiasing can bridge. A row drawn from its own bitmap cache composites a
+// raster that can sample past its bounds, and one with its own rotation or
+// scale clips in its rotated frame: both always draw.
+static bool rowMissesViewport(
+    ArtboardInstance* artboard,
+    const Mat2D& rowToDevice,
+    const AABB& viewport)
+{
+  if (!artboard->clip() || artboard->hasSelfTransform() ||
+      artboard->bitmapCache() != nullptr)
+  {
+    return false;
+  }
+  constexpr float margin = 2.0f;
+  const AABB row = rowToDevice.mapBoundingBox(artboard->bounds());
+  return row.maxX + margin <= viewport.minX ||
+         viewport.maxX + margin <= row.minX ||
+         row.maxY + margin <= viewport.minY ||
+         viewport.maxY + margin <= row.minY;
+}
+
 void ArtboardComponentList::draw(Renderer* renderer)
 {
-  if (needsSaveOperation())
+  // The rows keep their own opacity and get the list's here, so a fade
+  // doesn't walk every component in every row. Content drawn from an
+  // offscreen raster inside a row (a bitmap cache, a mask) fades as a group.
+  const float opacity = renderOpacity();
+  const bool modulates = opacity != 1.0f;
+  const bool saves = needsSaveOperation() || modulates;
+  if (saves)
   {
     renderer->save();
   }
+  if (modulates)
+  {
+    renderer->modulateOpacity(opacity);
+  }
   if (virtualizationEnabled())
   {
-    renderer->transform(
-        parent()->as<WorldTransformComponent>()->worldTransform());
+    const Mat2D& listTransform = parent()
+                                     ->as<WorldTransformComponent>()
+                                     ->worldTransform();
+    Mat2D listToDevice;
+    AABB deviceViewport;
+    const bool culls = viewportCullsBufferedRows(
+        renderer,
+        listTransform,
+        &listToDevice,
+        &deviceViewport);
+    renderer->transform(listTransform);
     if (!m_windowOrder.empty())
     {
       // We need to render in the correct order so we get the correct
@@ -1833,8 +2082,17 @@ void ArtboardComponentList::draw(Renderer* renderer)
         auto artboard = artboardInstance(i);
         if (artboard != nullptr)
         {
-          renderer->save();
           auto transform = m_artboardTransforms[artboard];
+          if (culls && !isWithinVisibleWindow(i) &&
+              rowMissesViewport(
+                  artboard,
+                  listToDevice * transform,
+                  deviceViewport))
+          {
+            artboard->skipDraw();
+            continue;
+          }
+          renderer->save();
           renderer->transform(transform);
           Component::artboard()->drawHosted(artboard, renderer);
           renderer->restore();
@@ -1858,7 +2116,7 @@ void ArtboardComponentList::draw(Renderer* renderer)
       }
     }
   }
-  if (needsSaveOperation())
+  if (saves)
   {
     renderer->restore();
   }
@@ -1924,6 +2182,17 @@ Mat2D ArtboardComponentList::worldTransformForArtboard(
 void ArtboardComponentList::update(ComponentDirt value)
 {
   Super::update(value);
+  // The rows draw with the list's opacity (see draw) and only hear when it
+  // turns fully transparent: content at 0 isn't hit, focused or selected,
+  // and defers its path updates. Tracked with no rows too, for rows added
+  // later (see addArtboardAt).
+  bool hidesOrShowsRows = false;
+  if (hasDirt(value, ComponentDirt::RenderOpacity))
+  {
+    const bool hidden = renderOpacity() <= 0.0f;
+    hidesOrShowsRows = hidden != m_rowsHidden;
+    m_rowsHidden = hidden;
+  }
   if (artboardCount() == 0)
   {
     return;
@@ -1938,13 +2207,16 @@ void ArtboardComponentList::update(ComponentDirt value)
       artboard->markSemanticBoundaryTransformDirty();
     });
   }
-  if (hasDirt(value, ComponentDirt::RenderOpacity))
+  if (hidesOrShowsRows)
   {
+    const float hostOpacity = m_rowsHidden ? 0.0f : 1.0f;
     forEachRealized([&](int, ArtboardInstance* artboard) {
-      artboard->opacity(renderOpacity());
+      artboard->hostOpacity(hostOpacity);
     });
   }
-  if (hasDirt(value, ComponentDirt::Components))
+  // Rows resolve a host opacity change in this update, or they show a frame
+  // late.
+  if (hidesOrShowsRows || hasDirt(value, ComponentDirt::Components))
   {
     const size_t count = m_listItems.size();
     for (size_t row = nextAwakeRow(0); row < count; row = nextAwakeRow(row + 1))
@@ -2197,6 +2469,8 @@ void ArtboardComponentList::addArtboardAt(
     if (artboardInstance != nullptr)
     {
       artboardInstance->host(this);
+      // A pooled row may still carry the opacity it last had here.
+      artboardInstance->hostOpacity(m_rowsHidden ? 0.0f : 1.0f);
       artboardInstance->frameOrigin(false);
       artboardInstance->parentIsRow(mainAxisIsRow());
       artboardInstance->parentIsStack(isStack());
@@ -2406,8 +2680,9 @@ void ArtboardComponentList::addVirtualizable(int index)
   if (listItem != nullptr)
   {
     auto artboard = findArtboard(listItem);
-    if (artboard != nullptr)
+    if (artboard != nullptr && !refusesNestedRow(artboard))
     {
+      RowBuildScope build(artboard, m_listSource, this);
       createArtboardRecorders(artboard);
       auto& pool = m_rowPool[artboard];
       if (pool.empty())
@@ -2696,7 +2971,8 @@ void ArtboardComponentList::attachArtboardOverride(ArtboardInstance* instance)
   auto source = instance->artboardSource();
   for (size_t i = 0, count = m_file->artboardCount(); i < count; i++)
   {
-    if (m_file->artboard(i) == source)
+    // Without decoding the artboards before it.
+    if (m_file->artboardHeader(i)->handsOut(source))
     {
       artboardIndex = static_cast<int>(i);
       break;

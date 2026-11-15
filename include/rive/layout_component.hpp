@@ -370,6 +370,13 @@ public:
     setLayoutFlag(LayoutComponentFlags::DirtyLayoutListed, value);
   }
 
+  // Whether this layout's clip is on the renderer right now: its proxy has
+  // clipped and its draw hasn't restored yet.
+  bool clipsDrawing() const
+  {
+    return hasLayoutFlag(LayoutComponentFlags::ClipSaved);
+  }
+
   LayoutComponentStyle* style() { return m_style; }
   void style(LayoutComponentStyle* style)
   {
@@ -413,7 +420,13 @@ public:
   // resolves, guaranteeing a proxy before the artboard's first sort.
   void markClipMayBeDynamic()
   {
-    setLayoutFlag(LayoutComponentFlags::ForceDrawableProxy, true);
+    // Marked again by a deferred animation body as it decodes, while other
+    // threads may be cloning this source and reading its flags: only write
+    // when there's something to change.
+    if (!hasLayoutFlag(LayoutComponentFlags::ForceDrawableProxy))
+    {
+      setLayoutFlag(LayoutComponentFlags::ForceDrawableProxy, true);
+    }
   }
   // Called from a scroll/scrollbar constraint's buildDependencies() (which
   // runs before the artboard's one-time proxy injection, on every instance)

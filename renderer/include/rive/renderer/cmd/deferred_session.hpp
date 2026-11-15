@@ -13,7 +13,9 @@
 #include "rive/renderer/render_canvas.hpp"
 #include "rive/renderer/render_context.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -28,6 +30,11 @@
     (defined(WITH_RIVE_SCRIPTING) || defined(RIVE_ORE) ||                      \
      defined(RIVE_CANVAS))
 #define RIVE_DEFERRED_ORE
+#endif
+
+// The layer mask compositor only builds with RIVE_CANVAS.
+#if defined(RIVE_DEFERRED_ORE) && defined(RIVE_CANVAS)
+#define RIVE_SESSION_LAYER_MASK
 #endif
 
 namespace rive::cmd
@@ -54,6 +61,7 @@ public:
   uint32_t drawnTargetSize() const { return 0; }
   void setTarget(const ore::Context::TargetDesc&) {}
   void drainPendingDestroys() {}
+  void finishOpenRenderPassesFrom(uint64_t) {}
   void resetFrame() {}
 
 private:
@@ -81,6 +89,21 @@ struct DeferredSegment
   uint32_t end;
   // Opened by beginCanvasContent. Replay keeps a canvas's last frame only.
   bool startsFrame = false;
+};
+
+// A run of Ore passes, closed once none is open, with the canvases it samples
+// and writes, so replay can move it ahead of a canvas that samples its output.
+struct DeferredOreSegment
+{
+  uint32_t begin;
+  uint32_t end;
+  // The 2D stream size when it closed, which ranks it against canvases no
+  // edge orders.
+  uint32_t recordPos;
+  std::vector<uint64_t> reads;
+  std::vector<uint64_t> writes;
+  // Touches the host target, which only exists inside the screen frame.
+  bool pinned = false;
 };
 
 // A host that keeps a raw session pointer across frames. The session tells it
@@ -144,7 +167,12 @@ public:
   using OreRecorder = NoOreRecorder;
 #endif
   OreRecorder& oreContext() { return m_ore; }
-  void bindReplayCaps(const ore::ReplayCaps& caps) { m_ore.bindCaps(caps); }
+  void bindReplayCaps(const ore::ReplayCaps& caps)
+  {
+    m_ore.bindCaps(caps);
+    // The failure belonged to the previous replay device.
+    m_layerMaskFailed->store(false, std::memory_order_relaxed);
+  }
 
   // Cross session image sharing lives here, not in an id space: the
   // registry carries a real rcp<RenderImage> through the frame snapshot, so
@@ -172,15 +200,55 @@ public:
   }
   Factory* renderContext() override { return m_renderContext; }
 
-  // Forwarded to the bound context, because that is the device this stream
-  // will replay against and only it knows whether the mask op exists there.
-  // Unbound (web, mid-import) keeps the optimistic default. Through Factory's
-  // virtual, since a Canvas-2D build binds something here that is not a
-  // render context at all.
+  // Masks composite in Ore with our embedded shaders, so the bound replay
+  // device has to run them.
   bool supportsLayerMask() const override
   {
-    return m_renderContext == nullptr || m_renderContext->supportsLayerMask();
+#ifdef RIVE_SESSION_LAYER_MASK
+    const ore::ReplayCaps& caps = m_ore.caps();
+    return m_renderContext != nullptr && caps.featuresKnown &&
+           caps.embeddedShaders &&
+           !m_layerMaskFailed->load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
   }
+#ifdef RIVE_SESSION_LAYER_MASK
+  // Recorded as the result canvas's frame, not as Ore, so it runs after
+  // content and coverage and before any sampler even when a script pins Ore.
+  bool composeLayerMask(
+      gpu::RenderCanvas* content,
+      gpu::RenderCanvas* coverage,
+      gpu::RenderCanvas* result,
+      LayerMaskMode mode) override
+  {
+    const RenderHandle contentId = canvasIdOf(content->renderImage());
+    const RenderHandle coverageId = canvasIdOf(coverage->renderImage());
+    const RenderHandle resultId = canvasIdOf(result->renderImage());
+    m_contentCanvases[resultId] = ref_rcp(result);
+    closeActiveRange();
+    m_activeRouted = false;
+    const uint32_t begin = streamSize();
+    for (RenderHandle id : {contentId, coverageId})
+    {
+      commandBuffer().append(
+          static_cast<uint8_t>(RenderCmd::canvasSample),
+          ResIdPOD{id | kCanvasHandleFlag});
+    }
+    commandBuffer().append(
+        static_cast<uint8_t>(RenderCmd::composeLayerMask),
+        ComposeLayerMaskPOD{
+            contentId | kCanvasHandleFlag,
+            coverageId | kCanvasHandleFlag,
+            resultId | kCanvasHandleFlag,
+            static_cast<uint32_t>(mode)});
+    m_segments.push_back(
+        {DeferredSegment::Target::canvas, resultId, begin, streamSize(), true});
+    resumeInterruptedRange();
+    m_composedLayerMask = true;
+    return true;
+  }
+#endif
   cmd::DeferredCanvasHost* deferredCanvasHost() override { return this; }
 
   // Recording: the stream only names the canvas, and whoever replays
@@ -356,11 +424,13 @@ public:
     m_activeStartsFrame = false;
   }
 
-  // Snapshots call this too since an errored script can leave a range open.
+  // Every capture calls this first, so a range or Ore pass left open lands in
+  // the frame it reads.
   void closeOpenRange()
   {
     closeActiveRange();
     reopenUnroutedRange();
+    m_ore.finishOpenRenderPassesFrom(0);
   }
 
   // ---- DeferredCanvasHost ----
@@ -369,8 +439,7 @@ public:
   Renderer* beginCanvasContent(gpu::RenderCanvas* canvas, uint32_t clearColor)
       override
   {
-    RenderHandle id = m_canvases.imageDrawId(canvas->renderImage()) &
-                      kCanvasHandleMask;
+    RenderHandle id = canvasIdOf(canvas->renderImage());
     assert(
         std::find(m_canvasStack.begin(), m_canvasStack.end(), id) ==
             m_canvasStack.end() &&
@@ -412,32 +481,38 @@ public:
   {
     // A script's draw visit can end its frame while an artboard still
     // draws into it with saves open.
-    auto recorder = m_canvasRenderers.find(
-        m_canvases.imageDrawId(canvas->renderImage()) & kCanvasHandleMask);
+    const RenderHandle id = canvasIdOf(canvas->renderImage());
+    auto recorder = m_canvasRenderers.find(id);
     if (recorder != m_canvasRenderers.end())
     {
       recorder->second->endContent();
     }
-    if (!m_canvasStack.empty())
+    // Scripts may end frames in any order.
+    auto open = std::find(m_canvasStack.rbegin(), m_canvasStack.rend(), id);
+    if (open != m_canvasStack.rend())
     {
-      m_canvasStack.pop_back();
+      m_canvasStack.erase(std::next(open).base());
     }
-    if (!m_canvasStack.empty())
-    {
-      // Resume the canvas this one interrupted.
-      routeTo(m_canvasStack.back());
-      return;
-    }
-    // Back to the screen whose recording the canvas interrupted, so the
-    // bytes that follow are not credited to a target that drew nothing.
-    if (m_hasOpenScreen)
-    {
-      routeTo(screenTarget(m_openScreen));
-      return;
-    }
-    closeActiveRange();
-    reopenUnroutedRange();
+    resumeInterruptedRange();
   }
+
+#ifdef WITH_RIVE_TOOLS
+  bool canvasContentOpen(gpu::RenderCanvas* canvas, const Renderer* reader)
+      const override
+  {
+    for (uint64_t id : m_canvasStack)
+    {
+      auto it = m_contentCanvases.find(static_cast<RenderHandle>(id));
+      if (it != m_contentCanvases.end() && it->second.get() == canvas)
+      {
+        // A canvas drawing itself reads its last frame by contract.
+        auto own = m_canvasRenderers.find(static_cast<RenderHandle>(id));
+        return own == m_canvasRenderers.end() || own->second.get() != reader;
+      }
+    }
+    return false;
+  }
+#endif
 
   // Destroys enter the stream only at a frame boundary, so an idle session
   // strands them. Drains them now and returns a copy of just those bytes;
@@ -471,6 +546,9 @@ public:
   {
     DeferredFactory::resetFrame();
     m_ore.resetFrame();
+    m_oreSegments.clear();
+    m_oreSegmentBegin = 0;
+    m_composedLayerMask = false;
     // A snapshot already carried these to its frame; an inline replay,
     // done on this thread, drops what is left here.
     m_canvasRetirer->take();
@@ -542,6 +620,27 @@ public:
   // content exists so an otherwise empty frame still replays.
   void recordOreReplayMarker() { m_hasOreMarker = true; }
 
+  // Whether this frame's replay needs the real Ore context. A mask composite
+  // needs it too, yet records in the 2D stream and leaves the Ore one empty.
+  bool replaysOre() const
+  {
+    return !m_ore.stream().commandBytes().empty() || m_composedLayerMask;
+  }
+
+  // Set by replay, on its own thread, once the device cannot build the mask
+  // pipelines, so later layers draw unmasked rather than empty.
+  const std::shared_ptr<std::atomic<bool>>& layerMaskFailed() const
+  {
+    return m_layerMaskFailed;
+  }
+
+  // Closed Ore runs in record order. Bytes past the last one replay in the
+  // screen frame.
+  const std::vector<DeferredOreSegment>& oreSegments() const
+  {
+    return m_oreSegments;
+  }
+
   // Render thread lookups for the replay hooks.
   gpu::RenderCanvas* contentCanvasAt(RenderHandle id) const
   {
@@ -566,20 +665,48 @@ public:
   }
 
 private:
+  RenderHandle canvasIdOf(RenderImage* image)
+  {
+    return m_canvases.imageDrawId(image) & kCanvasHandleMask;
+  }
+
+  std::vector<uint64_t> canvasIdsOf(const std::vector<rcp<RenderImage>>& images)
+  {
+    std::vector<uint64_t> ids;
+    ids.reserve(images.size());
+    for (const rcp<RenderImage>& image : images)
+    {
+      ids.push_back(canvasIdOf(image.get()));
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+  }
+
   void wireOreCanvases()
   {
 #ifdef RIVE_DEFERRED_ORE
     // Register wrapped canvases under the shared 2D id space so the
     // consumer can perform the real wrap at replay.
     m_ore.canvasIdProvider = [this](gpu::RenderCanvas* canvas) -> uint32_t {
-      RenderHandle id = m_canvases.imageDrawId(canvas->renderImage()) &
-                        kCanvasHandleMask;
+      RenderHandle id = canvasIdOf(canvas->renderImage());
       m_contentCanvases[id] = ref_rcp(canvas);
       return id;
     };
     // Lets view() on a canvas backed image resolve its canvas id off the
     // registry.
     m_ore.canvasRegistry = &m_canvases;
+    m_ore.segmentObserver =
+        [this](size_t end, OreRecorder::SegmentDeps&& deps) {
+          m_oreSegments.push_back(
+              {m_oreSegmentBegin,
+               static_cast<uint32_t>(end),
+               streamSize(),
+               canvasIdsOf(deps.reads),
+               canvasIdsOf(deps.writes),
+               deps.pinned});
+          m_oreSegmentBegin = static_cast<uint32_t>(end);
+        };
 #endif
     // The 2D stream shares the ore stream's single writer contract.
     commandBuffer().bindRecordingThread();
@@ -627,6 +754,24 @@ private:
                      segment.targetId == target;
             }),
         m_segments.end());
+  }
+
+  // Resumes the canvas or screen range that a canvas frame or mask composite
+  // interrupted. With neither open, the bytes that follow stay unrouted.
+  void resumeInterruptedRange()
+  {
+    if (!m_canvasStack.empty())
+    {
+      routeTo(m_canvasStack.back());
+      return;
+    }
+    if (m_hasOpenScreen)
+    {
+      routeTo(screenTarget(m_openScreen));
+      return;
+    }
+    closeActiveRange();
+    reopenUnroutedRange();
   }
 
   // Push the open range as a segment, closing a canvas one's bracket first.
@@ -682,8 +827,13 @@ private:
   // take these raw and keep drawing through them frame after frame.
   std::unordered_map<uint64_t, std::unique_ptr<Renderer>> m_screenRenderers;
   bool m_hasOreMarker = false;
+  bool m_composedLayerMask = false;
+  std::shared_ptr<std::atomic<bool>>
+      m_layerMaskFailed = std::make_shared<std::atomic<bool>>(false);
   // Scheduler segments recorded this frame, in script issue order.
   std::vector<DeferredSegment> m_segments;
+  std::vector<DeferredOreSegment> m_oreSegments;
+  uint32_t m_oreSegmentBegin = 0;
   uint64_t m_activeTarget = kScreenTarget; // target of the open range
   // False while the open range belongs to no target, which is how a frame
   // starts and where creates outside any renderer land.

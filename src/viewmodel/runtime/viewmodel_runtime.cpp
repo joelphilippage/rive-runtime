@@ -43,13 +43,15 @@ const std::string& ViewModelRuntime::name() const
 }
 
 std::vector<PropertyData> ViewModelRuntime::buildPropertiesData(
-    std::vector<rive::ViewModelProperty*>& properties)
+    std::vector<rive::ViewModelProperty*>& properties,
+    const File* file)
 {
   std::vector<PropertyData> props;
   for (auto property : properties)
   {
     DataType type = DataType::none;
     std::string enumName;
+    std::string viewModelName;
     switch (property->coreType())
     {
       case ViewModelPropertyString::typeKey:
@@ -84,8 +86,20 @@ std::vector<PropertyData> ViewModelRuntime::buildPropertiesData(
         type = DataType::trigger;
         break;
       case ViewModelPropertyViewModelBase::typeKey:
+      {
         type = DataType::viewModel;
+        auto* referenced = file != nullptr
+                               ? file->viewModel(
+                                     static_cast<ViewModelPropertyViewModel*>(
+                                         property)
+                                         ->viewModelReferenceId())
+                               : nullptr;
+        if (referenced != nullptr)
+        {
+          viewModelName = referenced->name();
+        }
         break;
+      }
       case ViewModelPropertySymbolListIndex::typeKey:
         type = DataType::symbolListIndex;
         break;
@@ -104,7 +118,7 @@ std::vector<PropertyData> ViewModelRuntime::buildPropertiesData(
       default:
         break;
     }
-    props.push_back({type, property->name(), enumName});
+    props.push_back({type, property->name(), enumName, viewModelName});
   }
   return props;
 }
@@ -112,16 +126,18 @@ std::vector<PropertyData> ViewModelRuntime::buildPropertiesData(
 std::vector<PropertyData> ViewModelRuntime::properties()
 {
   auto props = m_viewModel->properties();
-  return buildPropertiesData(props);
+  return buildPropertiesData(props, m_file);
 }
 
 std::vector<std::string> ViewModelRuntime::instanceNames() const
 {
-  auto instances = m_viewModel->instances();
+  // Names only: listing them shouldn't decode the instances' values.
   std::vector<std::string> names;
-  for (auto instance : instances)
+  size_t count = m_viewModel->instanceCount();
+  names.reserve(count);
+  for (size_t i = 0; i < count; i++)
   {
-    names.push_back(instance->name());
+    names.push_back(m_viewModel->instanceName(i));
   }
   return names;
 }

@@ -81,6 +81,32 @@ public:
   virtual void onDetach(WasmScriptingVM& vm) = 0;
 };
 
+#ifdef WITH_RIVE_TOOLS
+/// The objects behind a path effect's node handles for a host whose shapes
+/// are not runtime TransformComponents, like the editor's Dart stage. Ids
+/// are the source's own, 0 is none; they and every node they back hold for
+/// the one update that lent the shape.
+class WasmNodeSource
+{
+public:
+  virtual ~WasmNodeSource() = default;
+  /// x, y, rotation, scaleX, scaleY.
+  virtual void transform(uint32_t node, float out[5]) = 0;
+  /// An ArtboardWire node field.
+  virtual void set(uint32_t node, uint32_t field, float v0, float v1) = 0;
+  virtual void worldTransform(uint32_t node, float out[6]) = 0;
+  virtual void setWorldTransform(uint32_t node, const float values[6]) = 0;
+  /// Sets the local transform that puts the node at world.
+  virtual void decompose(uint32_t node, const float world[6]) = 0;
+  /// False when the node is not a path.
+  virtual bool path(uint32_t node, RawPath& out) = 0;
+  /// 0 when the parent is not a node.
+  virtual uint32_t parent(uint32_t node) = 0;
+  /// The children that are nodes, in order.
+  virtual void children(uint32_t node, std::vector<uint32_t>& out) = 0;
+};
+#endif
+
 class WasmScriptingVM : public ScriptBackend
 {
 public:
@@ -298,9 +324,17 @@ public:
   void deliverHeldOutcomes();
   /// deliverHeldOutcomes() for every VM on this thread holding some.
   static void deliverAllHeldOutcomes();
-  /// True while a decode or fetch this VM started has yet to reach the
-  /// module, held outcomes included.
+  /// True while work this VM started still needs a poll to reach the module:
+  /// a decode or fetch out, held outcomes, a main lane wait, an unfinished
+  /// job, a worker due a step, a processor starting, or an audio stream to
+  /// top up.
   bool hasPendingAsyncWork() const;
+  /// hasPendingAsyncWork() for the VMs this thread's polls reach: those
+  /// holding outcomes, and those whose lanes, main waits or streams started
+  /// here. For a host that polls the thread as a whole, like the editor,
+  /// rather than through artboards. Fetches and native decodes are
+  /// rive_hasPendingAsyncWork()'s.
+  static bool hasPendingAsyncWorkOnThread();
 
   /// The module's jobs section, null when it carries none.
   WasmJobs* jobs() const { return m_jobs.get(); }
@@ -415,6 +449,17 @@ public:
       const PathEffectPaintWire& paint,
       TransformComponent* shape,
       RawPath* outPath);
+#ifdef WITH_RIVE_TOOLS
+  /// The same call with the shape behind source, under its id shape.
+  bool callPathEffectUpdate(
+      ScriptedObject* object,
+      int selfRef,
+      const RawPath& sourcePath,
+      const PathEffectPaintWire& paint,
+      WasmNodeSource* source,
+      uint32_t shape,
+      RawPath* outPath);
+#endif
   bool callDataConvert(
       ScriptedObject* object,
       int selfRef,
@@ -598,6 +643,9 @@ public:
 
   /// Current size of the module's linear memory in 64KB wasm pages.
   uint32_t memoryPages() const;
+  /// Gives the system back the whole pages in [start, start + length) of
+  /// the module's memory, which read as zero when touched again.
+  void releasePages(uint32_t start, uint32_t length);
 
   /// Backend seams: host code reaches module memory and module functions
   /// only through these, so a browser backend can substitute staged
@@ -743,6 +791,10 @@ public:
   void setDebugHooks(WasmDebugHooks* hooks) { m_debugHooks = hooks; }
   WasmDebugHooks* debugHooks() const { return m_debugHooks; }
 
+  /// The file and line the std's console named as the caller of the line
+  /// this thread is writing, false for a line that names none.
+  static bool consoleCaller(std::string& file, uint32_t& line);
+
   /// Runs for every VM made on the calling thread, after its print sink
   /// is set and before its module starts, with the module as baked: the
   /// place to install debug hooks and a print sink that see module
@@ -827,6 +879,14 @@ protected:
   uint32_t mintTransitionChild(const TransitionChildRef& ref);
   void releaseTransitionChild(uint32_t handle);
   void releaseScopedNodes(size_t from);
+  // Runs update with node, a handle the caller scoped to this call or 0.
+  bool callPathEffectWithNode(
+      ScriptedObject* object,
+      int selfRef,
+      const RawPath& sourcePath,
+      const PathEffectPaintWire& paint,
+      uint32_t node,
+      RawPath* outPath);
   // A method name in guest memory: made once per instance when the module
   // can keep it past the frame, else copied for this call alone.
   class GuestName
@@ -878,6 +938,9 @@ private:
   };
   std::vector<OpenCanvasFrame> m_openCanvasFrames;
   uint64_t m_nextCanvasFrameToken = 1;
+#ifdef WITH_RIVE_TOOLS
+  bool m_warnedSampledOpenCanvas = false;
+#endif
   /// Object handles minted for the init scoped context, released once init
   /// completes or the context ref is released.
   std::unordered_map<int, uint32_t> m_contextObjects;
@@ -911,8 +974,8 @@ private:
       uint32_t argc,
       HitResult* outResult);
   /// In-flight fetches: module token to scriptnet request id, for
-  /// cancellation. The owner id scopes this VM's rate limits and lets
-  /// teardown cancel everything it started.
+  /// cancellation. The owner id scopes this VM's limits and lets teardown
+  /// cancel everything it started.
   std::unordered_map<uint32_t, uint32_t> m_pendingFetches;
   uint64_t m_netOwnerId = 0;
   void deliverFetchFailure(
@@ -1018,6 +1081,10 @@ private:
   /// Module exports __riveFrameRelease: its reap queues the handles it
   /// finds dead and the host releases them right after each collection.
   bool m_frameRelease = false;
+  /// Module exports __riveFrameTrim, which hands idle free chunks to
+  /// releasePages.
+  bool m_frameTrim = false;
+  uint32_t m_boundariesSinceTrim = 0;
   /// Module exports __riveHeapUsed; the leak watch reads bump bytes
   /// instead of page counts.
   bool m_heapUsedProbe = false;

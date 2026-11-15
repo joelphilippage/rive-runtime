@@ -114,6 +114,16 @@ void rive_web_data_context_release(uint32_t vmHandle, uint32_t dataContext)
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
     dataContextReleaseImpl(vm, dataContext);
 }
+uint32_t rive_web_data_context_equal(uint32_t vmHandle, uint32_t a, uint32_t b)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return dataContextEqualImpl(vm, a, b);
+}
+uint32_t rive_web_data_context_identity(uint32_t vmHandle, uint32_t dataContext)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return dataContextIdentityImpl(vm, dataContext);
+}
 uint32_t rive_web_data_has_view_model(uint32_t vmHandle, const char* name, uint32_t nameLength)
 {
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
@@ -189,6 +199,11 @@ uint32_t rive_web_data_vmi_equal(uint32_t vmHandle, uint32_t a, uint32_t b)
 {
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
     return dataVmiEqualImpl(vm, a, b);
+}
+uint32_t rive_web_data_vmi_identity(uint32_t vmHandle, uint32_t vmi)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return dataVmiIdentityImpl(vm, vmi);
 }
 uint32_t rive_web_data_view_model_get(uint32_t vmHandle, uint32_t property)
 {
@@ -266,6 +281,11 @@ uint32_t rive_web_data_blob_get(uint32_t vmHandle, uint32_t property, uint8_t* b
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
     return dataBlobGetImpl(vm, property, buffer, capacity);
 }
+uint32_t rive_web_data_blob_read(uint32_t vmHandle, uint32_t property, uint32_t offset, uint8_t* out, uint32_t outByteCount)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return dataBlobReadImpl(vm, property, offset, out, outByteCount);
+}
 uint32_t rive_web_data_blob_name(uint32_t vmHandle, uint32_t property, char* buffer, uint32_t capacity)
 {
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
@@ -280,6 +300,16 @@ void rive_web_data_blob_clear(uint32_t vmHandle, uint32_t property)
 {
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
     dataBlobClearImpl(vm, property);
+}
+void rive_web_data_blob_seen(uint32_t vmHandle, uint32_t property)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    dataBlobSeenImpl(vm, property);
+}
+uint32_t rive_web_data_blob_changed(uint32_t vmHandle, uint32_t property)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return dataBlobChangedImpl(vm, property);
 }
 uint32_t rive_web_data_artboard_get(uint32_t vmHandle, uint32_t property)
 {
@@ -311,6 +341,16 @@ void rive_web_data_prop_release(uint32_t vmHandle, uint32_t property)
 {
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
     dataPropReleaseImpl(vm, property);
+}
+uint32_t rive_web_data_prop_equal(uint32_t vmHandle, uint32_t a, uint32_t b)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return dataPropEqualImpl(vm, a, b);
+}
+uint32_t rive_web_data_prop_identity(uint32_t vmHandle, uint32_t property)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return dataPropIdentityImpl(vm, property);
 }
 void rive_web_data_trigger_fire(uint32_t vmHandle, uint32_t property)
 {
@@ -513,6 +553,17 @@ uint32_t rive_web_artboard_gamepad_event(uint32_t vmHandle, uint32_t artboard, c
 {
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
     return artboardGamepadEventImpl(vm, artboard, payload, byteCount);
+}
+uint32_t rive_web_artboard_keyboard_event(uint32_t vmHandle, uint32_t artboard, uint32_t key, uint32_t modifiers, uint32_t isPressed, uint32_t isRepeat)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return artboardKeyboardEventImpl(vm, artboard, key, modifiers, isPressed, isRepeat);
+}
+uint32_t rive_web_artboard_text_event(uint32_t vmHandle, uint32_t artboard, const char* text, uint32_t length)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    WasmStringArg textUtf8(vm, text, length);
+    return artboardTextEventImpl(vm, artboard, textUtf8.data(), textUtf8.size());
 }
 uint32_t rive_web_artboard_animation(uint32_t vmHandle, uint32_t artboard, const char* name, uint32_t length)
 {
@@ -1308,6 +1359,12 @@ uint32_t rive_web_blob_asset_bytes(uint32_t vmHandle, uint32_t object, const cha
     WasmStringArg nameUtf8(vm, name, nameLength);
     return blobAssetBytesImpl(vm, object, nameUtf8.data(), nameUtf8.size(), out, outCount);
 }
+uint32_t rive_web_blob_asset_read(uint32_t vmHandle, uint32_t object, const char* name, uint32_t nameLength, uint32_t offset, uint8_t* out, uint32_t outByteCount)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    WasmStringArg nameUtf8(vm, name, nameLength);
+    return blobAssetReadImpl(vm, object, nameUtf8.data(), nameUtf8.size(), offset, out, outByteCount);
+}
 uint32_t rive_web_image_from_asset(uint32_t vmHandle, uint32_t object, const char* name, uint32_t length)
 {
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
@@ -1338,6 +1395,11 @@ void rive_web_image_decode_cancel(uint32_t vmHandle, uint32_t token)
 {
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
     imageDecodeCancelImpl(vm, token);
+}
+uint32_t rive_web_image_load(uint32_t vmHandle, const uint8_t* bytes, uint32_t byteCount)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return imageLoadImpl(vm, bytes, byteCount);
 }
 uint32_t rive_web_font_from_asset(uint32_t vmHandle, uint32_t object, const char* name, uint32_t length)
 {
@@ -1652,10 +1714,21 @@ uint32_t rive_web_file_bindable_data(uint32_t vmHandle, uint32_t bindable)
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
     return fileBindableDataImpl(vm, bindable);
 }
+uint32_t rive_web_file_host_bindable(uint32_t vmHandle, uint32_t object, const char* name, uint32_t nameLength, uint32_t useDefault)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    WasmStringArg nameUtf8(vm, name, nameLength);
+    return fileHostBindableImpl(vm, object, nameUtf8.data(), nameUtf8.size(), useDefault);
+}
 uint32_t rive_web_file_bindable_equal(uint32_t vmHandle, uint32_t a, uint32_t b)
 {
     WasmScriptingVM* vm = vmFromHandle(vmHandle);
     return fileBindableEqualImpl(vm, a, b);
+}
+uint32_t rive_web_file_bindable_identity(uint32_t vmHandle, uint32_t bindable)
+{
+    WasmScriptingVM* vm = vmFromHandle(vmHandle);
+    return fileBindableIdentityImpl(vm, bindable);
 }
 uint32_t rive_web_lanes_start(uint32_t vmHandle, uint32_t kind, uint32_t entry, const uint8_t* input, uint32_t inputByteCount, const uint32_t* holds, uint32_t holdCount)
 {
@@ -1905,6 +1978,8 @@ static void* const kRiveWebCalls[] = {
     (void*)rive_web_data_context_parent,
     (void*)rive_web_data_context_view_model,
     (void*)rive_web_data_context_release,
+    (void*)rive_web_data_context_equal,
+    (void*)rive_web_data_context_identity,
     (void*)rive_web_data_has_view_model,
     (void*)rive_web_data_new_view_model,
     (void*)rive_web_data_vmi_release,
@@ -1918,6 +1993,7 @@ static void* const kRiveWebCalls[] = {
     (void*)rive_web_data_vmi_instance,
     (void*)rive_web_data_vmi_symbol_index,
     (void*)rive_web_data_vmi_equal,
+    (void*)rive_web_data_vmi_identity,
     (void*)rive_web_data_view_model_get,
     (void*)rive_web_data_vmi_list,
     (void*)rive_web_data_vmi_enum,
@@ -1932,15 +2008,20 @@ static void* const kRiveWebCalls[] = {
     (void*)rive_web_data_font_release,
     (void*)rive_web_data_blob_present,
     (void*)rive_web_data_blob_get,
+    (void*)rive_web_data_blob_read,
     (void*)rive_web_data_blob_name,
     (void*)rive_web_data_blob_set,
     (void*)rive_web_data_blob_clear,
+    (void*)rive_web_data_blob_seen,
+    (void*)rive_web_data_blob_changed,
     (void*)rive_web_data_artboard_get,
     (void*)rive_web_data_artboard_set,
     (void*)rive_web_data_enum_get,
     (void*)rive_web_data_enum_set,
     (void*)rive_web_data_enum_values,
     (void*)rive_web_data_prop_release,
+    (void*)rive_web_data_prop_equal,
+    (void*)rive_web_data_prop_identity,
     (void*)rive_web_data_trigger_fire,
     (void*)rive_web_data_list_length,
     (void*)rive_web_data_list_push,
@@ -1981,6 +2062,8 @@ static void* const kRiveWebCalls[] = {
     (void*)rive_web_artboard_pointer_event,
     (void*)rive_web_artboard_scroll_event,
     (void*)rive_web_artboard_gamepad_event,
+    (void*)rive_web_artboard_keyboard_event,
+    (void*)rive_web_artboard_text_event,
     (void*)rive_web_artboard_animation,
     (void*)rive_web_artboard_animation_release,
     (void*)rive_web_artboard_animation_duration,
@@ -2145,12 +2228,14 @@ static void* const kRiveWebCalls[] = {
     (void*)rive_web_mesh_instances_update,
     (void*)rive_web_mesh_instances_release,
     (void*)rive_web_blob_asset_bytes,
+    (void*)rive_web_blob_asset_read,
     (void*)rive_web_image_from_asset,
     (void*)rive_web_image_width,
     (void*)rive_web_image_height,
     (void*)rive_web_image_release,
     (void*)rive_web_image_decode,
     (void*)rive_web_image_decode_cancel,
+    (void*)rive_web_image_load,
     (void*)rive_web_font_from_asset,
 #ifdef WITH_RIVE_TEXT
     (void*)rive_web_font_decode,
@@ -2274,7 +2359,9 @@ static void* const kRiveWebCalls[] = {
     (void*)rive_web_file_bindable_release,
     (void*)rive_web_file_bindable_name,
     (void*)rive_web_file_bindable_data,
+    (void*)rive_web_file_host_bindable,
     (void*)rive_web_file_bindable_equal,
+    (void*)rive_web_file_bindable_identity,
     (void*)rive_web_lanes_start,
     (void*)rive_web_lanes_state,
     (void*)rive_web_lanes_failed,

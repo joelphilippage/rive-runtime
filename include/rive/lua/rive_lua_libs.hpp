@@ -72,6 +72,7 @@ class Artboard;
 class ArtboardInstance;
 class NestedArtboard;
 class Factory;
+class ScriptBackend;
 class File;
 class ModuleDetails;
 class ScriptedObject;
@@ -360,6 +361,7 @@ enum class LuaAtoms : int16_t
 
   // Image decode
   decodeImage,
+  loadImage,
 
   // Mat4
   transpose,
@@ -507,6 +509,10 @@ enum class LuaAtoms : int16_t
   delta,
   precise,
   pointerScroll,
+
+  // Keyboard and text input forwarded to a script's artboard
+  keyboardEvent,
+  textEvent,
 };
 
 struct ScriptedMat2D
@@ -2091,6 +2097,9 @@ public:
   {
     return m_factory != nullptr ? m_factory->deferredCanvasHost() : nullptr;
   }
+#ifdef WITH_RIVE_TOOLS
+  bool warnedSampledOpenCanvas = false;
+#endif
 
   // WorkPool for async operations (image decode, etc.).
   // Lazily created on first access. Shared across all contexts via a
@@ -2117,6 +2126,16 @@ public:
   // has yet to be delivered, including WASM browser-native decodes started
   // on mainThread. Other contexts' work doesn't count.
   bool hasPendingAsyncWork(lua_State* mainThread) const;
+
+  // The backend the scripted objects running on this context register with:
+  // the ScriptingVM that owns it, or null for a bare lua_State.
+  void scriptBackend(ScriptBackend* backend) { m_scriptBackend = backend; }
+  // A promise async work this context started settled (a fetch answered, a
+  // decode finished): tells the backend's objects, whose continuation may
+  // have changed state they read (see ScriptBackend::asyncWorkDelivered).
+  void asyncWorkDelivered();
+  // asyncWorkDelivered() for L's context, if it has one.
+  static void asyncWorkDelivered(lua_State* L);
 
   // WebGL/WASM only: whether an ore frame is currently open for this VM.
   // riveLuaPCall uses this to auto-open a mini-frame when Lua callbacks
@@ -2211,6 +2230,7 @@ private:
 
 private:
   Factory* m_renderContext = nullptr;
+  ScriptBackend* m_scriptBackend = nullptr;
   uint64_t m_ownerId = 0;
   bool m_oreFrameOpen = false;
   bool m_gpuCanvasDeferOnly = false;
@@ -2602,8 +2622,10 @@ private:
   rcp<T> m_key;
 };
 
-#ifdef WITH_RIVE_SCRIPTNET
-// ── Decoded Rive files (context:decodeFile) ────────────────────────────────
+// ── Bindable artboards and decoded Rive files ──────────────────────────────
+//
+// The artboard property, BindableArtboard and context:bindableArtboard need
+// no networking; only context:decodeFile does (WITH_RIVE_SCRIPTNET).
 
 class BindableArtboard;
 class ViewModelInstanceArtboard;
@@ -2624,8 +2646,9 @@ public:
 };
 
 /// An artboard of a decoded file, with an instance of the view model its
-/// binds read from that same file. Assigning it to a view model artboard
-/// property binds both.
+/// binds read from that same file, or one of the host file's own artboards
+/// from context:bindableArtboard, with none. Assigning it to a view model
+/// artboard property binds both.
 class ScriptedBindableArtboard
 {
 public:
@@ -2662,7 +2685,6 @@ public:
   /// Assigns the BindableArtboard (or nil) at valueIdx.
   void setValue(lua_State* L, int valueIdx);
 };
-#endif
 
 class ScriptedContext
 {
@@ -2961,7 +2983,12 @@ public:
 #ifdef WITH_RIVE_TOOLS
     if (error)
     {
-      printBeginLine(state);
+      // Type 1 marks an error line, as the editor's own context writes it.
+      // The message names its site; the frame here is the error builtin.
+      BinaryWriter writer(&m_consoleBuffer);
+      writer.write((uint8_t)1);
+      writer.write("");
+      writer.writeVarUint((uint32_t)0);
       print(Span<const char>(error, strlen(error)));
       printEndLine();
     }

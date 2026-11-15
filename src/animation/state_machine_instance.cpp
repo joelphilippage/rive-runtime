@@ -156,6 +156,7 @@ public:
       , m_stateMachineChangedOnAdvance(false)
       , m_waitingForExit(false)
       , m_settled(false)
+      , m_poseApplied(false)
   {}
 
   ~StateMachineLayerInstance()
@@ -271,7 +272,14 @@ public:
   // advance started.
   bool isFrozen(const StateMachineInstance* smi, uint32_t poseSince) const
   {
-    if (!m_settled || m_mix != 1.0f || m_animationReset != nullptr ||
+    return m_settled && isPoseHeld(smi, poseSince);
+  }
+
+  // Everything isFrozen asks but whether the layer is settled: advancing
+  // and applying it would write what is already in place.
+  bool isPoseHeld(const StateMachineInstance* smi, uint32_t poseSince) const
+  {
+    if (m_mix != 1.0f || m_animationReset != nullptr ||
         m_holdAnimation != nullptr ||
         (m_transition != nullptr && !m_transitionCompleted) ||
         m_currentState == nullptr || m_currentState->keepGoing())
@@ -501,17 +509,30 @@ public:
 #endif
       return false;
     }
-    m_currentState->advance(seconds, smi);
-    updateMix(smi, seconds);
-
-    if (m_stateFrom != nullptr && m_mix < 1.0f && !m_holdAnimationFrom)
+    // Held but not settled, with its pose applied: a change to something
+    // its transitions read unsettled it (see
+    // StateMachineInstance::unsettleLayers), or they read what can't
+    // settle. Advancing and applying first would write the pose that is
+    // already in place, so it searches first, and stays as it is, as a
+    // frozen layer does, unless the search changes state.
+    bool searchFirst = m_poseApplied && isPoseHeld(smi, poseSince);
+#ifdef TESTING
+    searchFirst = searchFirst && StateMachineInstance::sm_searchBeforeReapply;
+#endif
+    if (!searchFirst)
     {
-      // This didn't advance during our updateState, but it should now
-      // that we realize we need to mix it in.
-      m_stateFrom->advance(seconds, smi);
-    }
+      m_currentState->advance(seconds, smi);
+      updateMix(smi, seconds);
 
-    apply(smi);
+      if (m_stateFrom != nullptr && m_mix < 1.0f && !m_holdAnimationFrom)
+      {
+        // This didn't advance during our updateState, but it should now
+        // that we realize we need to mix it in.
+        m_stateFrom->advance(seconds, smi);
+      }
+
+      apply(smi);
+    }
 
     bool changedState = false;
 
@@ -809,6 +830,7 @@ public:
                            ? nullptr
                            : stateTo->makeInstance(artboardOf(smi)).release();
     }
+    m_poseApplied = false;
     if (m_currentState != nullptr && smi->m_layerWrites.get() != nullptr)
     {
       m_currentState->layerAccumulator(smi->m_layerWrites.get());
@@ -1091,6 +1113,7 @@ public:
       auto mix = interpolator != nullptr ? interpolator->transform(m_mix)
                                          : m_mix;
       m_currentState->apply(artboardInstance, mix);
+      m_poseApplied = true;
     }
   }
 
@@ -1152,6 +1175,10 @@ private:
   // The last search found nothing and nothing it read has changed since,
   // so the next one would find nothing too. See updateState.
   bool m_settled : 1;
+  // The current state has been applied since the layer entered it. Until
+  // then a pose can read as held (isPoseHeld) without being in place: the
+  // change serials it compares start equal.
+  bool m_poseApplied : 1;
 };
 
 // Instances with a capture-phase pointer listener of their own. While there are
@@ -1564,12 +1591,8 @@ public:
   }
 };
 
-// The pointers a host turned off (its capture claim, or a drag above it) for
-// the machines a hit component hosts. Those machines can change while one is
-// off -- a list realizes or adds a row, a nested artboard swaps its machine --
-// so each is turned off as an event reaches it, not only when the host turned
-// the pointer off.
-class HostedPointersOff
+// A set of pointer ids a hit component keeps for the machines it hosts.
+class HostedPointers
 {
 public:
   void add(int pointerId) { m_ids.pushUnique(pointerId); }
@@ -1579,6 +1602,19 @@ public:
     const auto& ids = m_ids.view();
     return std::find(ids.begin(), ids.end(), pointerId) != ids.end();
   }
+
+private:
+  LazyVector<int> m_ids;
+};
+
+// The pointers a host turned off (its capture claim, or a drag above it) for
+// the machines a hit component hosts. Those machines can change while one is
+// off -- a list realizes or adds a row, a nested artboard swaps its machine --
+// so each is turned off as an event reaches it, not only when the host turned
+// the pointer off.
+class HostedPointersOff : public HostedPointers
+{
+public:
   void keepOff(StateMachineInstance* machine, int pointerId) const
   {
     if (machine != nullptr && has(pointerId) &&
@@ -1587,9 +1623,6 @@ public:
       machine->disablePointerEvents(pointerId);
     }
   }
-
-private:
-  LazyVector<int> m_ids;
 };
 
 class HitNestedArtboard : public HitComponent
@@ -1893,17 +1926,44 @@ public:
       // The pointer left: the machines below forget it, and so does this.
       m_pointersOff.remove(pointerId);
     }
-    if (nestedArtboard->isCollapsed() || nestedArtboard->isHidden() ||
-        nestedArtboard->isPaused())
+    // A lift for a press this host passed down has to reach the machines
+    // below, or the press stays behind in their listener groups.
+    const bool lifted = hitType == ListenerType::up ||
+                        hitType == ListenerType::exit;
+    const bool liftsPress = lifted && m_pressed.has(pointerId);
+    if (lifted)
+    {
+      m_pressed.remove(pointerId);
+    }
+    const bool shown = !nestedArtboard->isCollapsed() &&
+                       !nestedArtboard->isHidden() &&
+                       !nestedArtboard->isPaused();
+    if (!shown && !liftsPress)
     {
       return hitResult;
     }
     Vec2D nestedPosition;
     bool offMesh;
-    if (!nestedArtboard->worldToLocal(position, &nestedPosition, &offMesh))
+    // False when the mounted artboard isn't ready or has a 0 scale transform.
+    bool mapped = nestedArtboard->worldToLocal(
+        position,
+        &nestedPosition,
+        &offMesh);
+    if (!shown || !mapped)
     {
-      // Mounted artboard isn't ready or has a 0 scale transform.
+      // Sent as an exit, at the raw position when a 0 scale has no local one.
+      if (liftsPress)
+      {
+        forEachStateMachine([&](StateMachineInstance* smi) {
+          HostDispatchScope dispatch(smi);
+          smi->pointerExit(mapped ? nestedPosition : position, pointerId);
+        });
+      }
       return hitResult;
+    }
+    if (hitType == ListenerType::down)
+    {
+      m_pressed.add(pointerId);
     }
     // Past the edge of the mesh it's drawn through, or while this machine
     // misses the pointer itself, nothing in the artboard can be hit, but a
@@ -2136,6 +2196,8 @@ public:
 
 private:
   HostedPointersOff m_pointersOff;
+  // Pointers pressed through this host and not yet lifted.
+  HostedPointers m_pressed;
 
   template <typename F> void forEachStateMachine(F&& visit)
   {
@@ -2487,21 +2549,42 @@ public:
       // For a row the list stops showing, which gets its exit then.
       componentList->notePointer(pointerId, position);
     }
-    if (componentList->isCollapsed() || componentList->isHidden())
+    // See HitNestedArtboard::processEvent.
+    const bool lifted = hitType == ListenerType::up ||
+                        hitType == ListenerType::exit;
+    const bool liftsPress = lifted && m_pressed.has(pointerId);
+    if (lifted)
+    {
+      m_pressed.remove(pointerId);
+    }
+    const bool hidden = componentList->isCollapsed() ||
+                        componentList->isHidden();
+    if (hidden && !liftsPress)
     {
       return hitResult;
+    }
+    if (hitType == ListenerType::down && !hidden)
+    {
+      m_pressed.add(pointerId);
     }
     const auto& order = componentList->orderedListIndices();
     for (auto it = order.rbegin(); it != order.rend(); ++it)
     {
       const int i = *it;
       Vec2D listPosition;
-      bool hit = componentList->worldToLocal(position, &listPosition, i);
-      if (!hit)
+      bool mapped = componentList->worldToLocal(position, &listPosition, i);
+      auto stateMachine = componentList->stateMachineInstance(i);
+      if (hidden || !mapped)
       {
+        if (liftsPress && stateMachine != nullptr)
+        {
+          HostDispatchScope dispatch(stateMachine);
+          stateMachine->pointerExit(
+              mapped ? listPosition : position,
+              pointerId);
+        }
         continue;
       }
-      auto stateMachine = componentList->stateMachineInstance(i);
       if (stateMachine != nullptr)
       {
         m_pointersOff.keepOff(stateMachine, pointerId);
@@ -2806,6 +2889,8 @@ public:
 
 private:
   HostedPointersOff m_pointersOff;
+  // See HitNestedArtboard.
+  HostedPointers m_pressed;
 };
 
 #ifdef WITH_RIVE_TEXT
@@ -3577,8 +3662,11 @@ HitResult StateMachineInstance::captureLocalPointer(
     if (canHit && group->isPointerHovered(pointerId))
     {
       result = HitResult::hit;
+      // Only a listener that stops propagation claims; any other capture
+      // listener only observes, and the press goes on inward.
       if (hitType == ListenerType::down &&
-          group->listener()->claimsPress(button))
+          group->listener()->claimsPress(button) &&
+          group->listener()->stopsPropagation())
       {
         claimPointer(captureHit.target, pointerId, button);
       }
@@ -4199,6 +4287,8 @@ uint64_t StateMachineInstance::sm_settledLayerSkips = 0;
 uint64_t StateMachineInstance::sm_capturePassVisits = 0;
 uint64_t StateMachineInstance::sm_frozenLayerAdvances = 0;
 uint64_t StateMachineInstance::sm_frozenPoseAdvances = 0;
+uint64_t StateMachineInstance::sm_asyncSkips = 0;
+bool StateMachineInstance::sm_verifyAsyncSkips = true;
 
 const LayerState* StateMachineInstance::layerState(size_t index)
 {
@@ -4365,6 +4455,7 @@ StateMachineInstance::StateMachineInstance(
     , m_hostDispatching(false)
     , m_captureRunByHost(false)
     , m_inPointerMiss(false)
+    , m_awaitingAsync(false)
 {
   const auto count = machine->inputCount();
   m_inputInstances.resize(count);
@@ -4461,7 +4552,23 @@ StateMachineInstance::StateMachineInstance(
   // instance. That enables binding each instance to its own context without
   // polluting the rest.
   auto dataBindCount = machine->dataBindCount();
+#ifndef WITH_RIVE_EDITOR
+#ifdef TESTING
+  static const std::vector<int32_t> noTwins;
+  const std::vector<int32_t>& twins = sm_shareBindables
+                                          ? machine->bindableTwins()
+                                          : noTwins;
+#else
+  const std::vector<int32_t>& twins = machine->bindableTwins();
+#endif
+  reserveDataBinds(
+      dataBindCount -
+      std::count_if(twins.begin(), twins.end(), [](int32_t twin) {
+        return twin >= 0;
+      }));
+#else
   reserveDataBinds(dataBindCount);
+#endif
   for (size_t i = 0; i < dataBindCount; i++)
   {
     auto dataBind = machine->dataBind(i);
@@ -4469,6 +4576,22 @@ StateMachineInstance::StateMachineInstance(
     {
       continue;
     }
+#ifndef WITH_RIVE_EDITOR
+    if (!twins.empty() && twins[i] >= 0)
+    {
+      // Its bindable always holds what its twin's does, so the twin's clone
+      // stands in for it and its bind isn't made. The twin is an earlier
+      // bind with a target, so its clone is made.
+      auto& bindables = ensureBindables();
+      auto twin = machine->dataBind(twins[i])->target()->as<BindableProperty>();
+      BindableProperty* twinClone = bindables.propertyInstances.find(twin);
+      assert(twinClone != nullptr);
+      bindables.propertyInstances.insertTwin(
+          dataBind->target()->as<BindableProperty>(),
+          twinClone);
+      continue;
+    }
+#endif
     auto dataBindClone = static_cast<DataBind*>(dataBind->clone());
     dataBindClone->file(dataBind->file());
     if (dataBind->converter() != nullptr)
@@ -5008,6 +5131,8 @@ StateMachineInstance::~StateMachineInstance()
   // so they are deleted here rather than by the cluster's destructor.
   if (auto* bindables = m_bindables.get())
   {
+    // Each clone once: twins hold one between them. The machine itself may
+    // be gone by now (a script can hold an artboard past its file's).
     bindables->propertyInstances.forEachInstance(
         [](BindableProperty* instance) { delete instance; });
     for (auto& outer : bindables->transitionPropertyInstances)
@@ -5591,14 +5716,151 @@ bool StateMachineInstance::advanceAndApply(float seconds)
     // its first frame is ready the instant the watermark ends, but don't
     // let it animate forward. Reporting "keep going" matters here, a false
     // would read as settled and stop the host's ticker mid pre-roll.
+    m_awaitingAsync = false;
     advanceAndApply(0.0f, true);
+    return true;
+  }
+  // Settled but for its scripts' async work, with nothing changed since,
+  // this frame's advance would do nothing: the poll above was all it had.
+  if (skipWhileAwaitingAsync(seconds))
+  {
+    return true;
+  }
+  if (advanceAndApply(seconds, true))
+  {
+    m_awaitingAsync = false;
     return true;
   }
   // Keep going while this artboard's scripts have async work outstanding,
   // even once settled: a host that stops ticking on false would never poll
   // the result in.
-  return advanceAndApply(seconds, true) ||
-         m_artboardInstance->hasPendingAsyncWork();
+  if (!m_artboardInstance->hasPendingAsyncWork())
+  {
+    m_awaitingAsync = false;
+    return false;
+  }
+  armAwaitingAsync();
+  return true;
+}
+
+bool StateMachineInstance::ownsScriptedConditions() const
+{
+  if (auto* scripting = m_scripting.get())
+  {
+    for (const auto& pair : scripting->objects)
+    {
+      if (pair.second != nullptr &&
+          pair.second->scriptProtocol() == ScriptProtocol::transitionCondition)
+      {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Whether a machine in one of artboard's nested artboards, at any depth, owns
+// a scripted transition condition. A list's rows need no look: one whose
+// machine runs scripts never goes quiet, so markQuietAwaitingAsync refuses
+// its list.
+static bool hostsScriptedConditions(Artboard* artboard)
+{
+  for (auto* nestedArtboard : artboard->nestedArtboards())
+  {
+    for (auto* animation : nestedArtboard->nestedAnimations())
+    {
+      if (!animation->is<NestedStateMachine>())
+      {
+        continue;
+      }
+      auto* machine = animation->as<NestedStateMachine>()
+                          ->stateMachineInstance();
+      if (machine != nullptr && machine->ownsScriptedConditions())
+      {
+        return true;
+      }
+    }
+    auto* instance = nestedArtboard->artboardInstance();
+    if (instance != nullptr && hostsScriptedConditions(instance))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+void StateMachineInstance::armAwaitingAsync()
+{
+  // A row's machine never comes through advanceAndApply(float), and a
+  // machine that reads pending changes needs its bindables' baseline to
+  // hear the ones that report no wake (a component trigger fired directly).
+  // Events still reported (reportedEventCount, those applied during the
+  // last applyEvents loop included) stay visible until the next advance,
+  // so skipping would hand a host the same ones every frame.
+  m_awaitingAsync = !m_needsAdvance && !m_bindsPending &&
+                    !hasPendingReports() && reportedEventCount() == 0 &&
+                    !hasDataBindWork(/*applyTargetToSource=*/false) &&
+                    (!m_machine->readsPendingChanges() ||
+                     m_bindables.get() != nullptr) &&
+                    !ownsScriptedConditions() &&
+                    !hostsScriptedConditions(m_artboardInstance) &&
+                    m_artboardInstance->markQuietAwaitingAsync();
+}
+
+bool StateMachineInstance::skipWhileAwaitingAsync(float seconds)
+{
+  if (!m_awaitingAsync)
+  {
+    return false;
+  }
+  // What wakes a quiet row wakes the artboard (dirt, binds, layout, its
+  // data context, this machine's inputs and listeners); the rest is
+  // checked here. The change sequence moves for every view model change,
+  // anyone's, so it also catches one this machine reads without a wake.
+  // The mark is the artboard's, so another machine advancing it can set it
+  // again after a change this one hasn't seen; the artboard's change serial
+  // against where it stood when this machine last advanced catches that.
+  auto* bindables = m_bindables.get();
+  auto* focus = focusManager();
+  if (!m_artboardInstance->quietAwaitingAsync() ||
+      m_advanceChangeSerial != m_artboardInstance->changeSerial() ||
+      m_needsAdvance || m_bindsPending || hasPendingReports() ||
+      m_drawOrderChangeCounter !=
+          m_artboardInstance->drawOrderChangeCounter() ||
+      (bindables != nullptr &&
+       bindables->listenerBaseline !=
+           ViewModelInstanceValue::latestChangeSequence()) ||
+      (focus != nullptr && focus->hasPendingFocusRequests(rootArtboard())) ||
+      !m_artboardInstance->hasPendingAsyncWork())
+  {
+    m_awaitingAsync = false;
+    return false;
+  }
+#ifdef TESTING
+  sm_asyncSkips++;
+  if (sm_verifyAsyncSkips)
+  {
+    // Advancing by 0 always reports keep going (see the overload below).
+    auto dirt = Artboard::sm_dirtNotifications;
+    auto sequence = ViewModelInstanceValue::latestChangeSequence();
+    bool keepGoing = advanceAndApply(seconds, true) && seconds != 0.0f;
+    if (keepGoing || dirt != Artboard::sm_dirtNotifications ||
+        sequence != ViewModelInstanceValue::latestChangeSequence() ||
+        stateChangedCount() != 0 || m_needsAdvance || hasPendingReports())
+    {
+      fprintf(
+          stderr,
+          "State machine %s on artboard %s skipped an advance awaiting "
+          "async work, but the advance did work\n",
+          m_machine->name().c_str(),
+          m_artboardInstance->name().c_str());
+      abort();
+    }
+  }
+#else
+  (void)seconds;
+#endif
+  return true;
 }
 
 bool StateMachineInstance::advanceAndApply(
@@ -5677,6 +5939,8 @@ bool StateMachineInstance::advanceAndApply(
 bool StateMachineInstance::sm_layerAccumulatorEnabled = true;
 
 #ifdef TESTING
+bool StateMachineInstance::sm_shareBindables = true;
+bool StateMachineInstance::sm_searchBeforeReapply = true;
 bool StateMachineInstance::sm_reuseStateInstances = true;
 uint64_t StateMachineInstance::sm_reusedStateInstances = 0;
 #endif
