@@ -12,6 +12,7 @@
 #include "rive/math/mat2d.hpp"
 #include "rive/nested_artboard.hpp"
 #include "rive/node.hpp"
+#include "rive/scripted/scripted_layout.hpp"
 #include "rive/parent_traversal.hpp"
 #include "rive/semantic/semantic_data.hpp"
 #include "rive/semantic/semantic_provider.hpp"
@@ -697,11 +698,45 @@ void FocusData::update(ComponentDirt value)
 bool FocusData::worldBounds(AABB& outBounds)
 {
   auto* parentComponent = parent();
-  if (parentComponent == nullptr || !parentComponent->is<LayoutComponent>())
+  if (parentComponent == nullptr)
   {
     return false;
   }
-  AABB bounds = parentComponent->as<LayoutComponent>()->worldBounds();
+  AABB bounds;
+  if (parentComponent->is<LayoutComponent>())
+  {
+    bounds = parentComponent->as<LayoutComponent>()->worldBounds();
+  }
+  else if (parentComponent->is<ScriptedLayout>())
+  {
+    // sippydisco patch: a scripted layout (a self-drawn slider, say) has no
+    // layout box of its own, so without this it had no bounds and directional
+    // traversal could never land on it. It draws from its origin at the size
+    // the layout engine gave it.
+    auto* layout = parentComponent->as<ScriptedLayout>();
+    Vec2D size;
+    if (!layout->layoutSize(size))
+    {
+      return false;
+    }
+    const Mat2D& world = layout->worldTransform();
+    const Vec2D corners[4] = {world * Vec2D(0.0f, 0.0f),
+                              world * Vec2D(size.x, 0.0f),
+                              world * Vec2D(size.x, size.y),
+                              world * Vec2D(0.0f, size.y)};
+    bounds = AABB(corners[0].x, corners[0].y, corners[0].x, corners[0].y);
+    for (const Vec2D& corner : corners)
+    {
+      bounds.minX = std::min(bounds.minX, corner.x);
+      bounds.minY = std::min(bounds.minY, corner.y);
+      bounds.maxX = std::max(bounds.maxX, corner.x);
+      bounds.maxY = std::max(bounds.maxY, corner.y);
+    }
+  }
+  else
+  {
+    return false;
+  }
   // Transform to root artboard space (handles nested artboards); all four
   // corners so rotated/skewed hosts still yield a valid AABB.
   auto* ab = artboard();
